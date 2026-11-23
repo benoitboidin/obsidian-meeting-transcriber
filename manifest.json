@@ -3,7 +3,8 @@
   "name": "Meeting Transcriber",
   "version": "0.1.0",
   "minAppVersion": "1.5.0",
-  "description": "Record online and in-person meetings and insert a local, diarized transcript and summary (faster-whisper, pyannote, Ollama).",
-  "author": "Benoît",
+  "description": "Record online and in-person meetings, then insert a speaker-labelled transcript and summary into your notes using local models only.",
+  "author": "Benoît Boidin",
+  "authorUrl": "https://github.com/benoitboidin",
   "isDesktopOnly": true
 }

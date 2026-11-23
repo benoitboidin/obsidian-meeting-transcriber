@@ -15,6 +15,7 @@ export interface MTSettings {
 	uvPath: string;
 	ffmpegPath: string;
 	backendPort: number;
+	backendDir: string;
 	backendIdleMinutes: number; // 0 = never stop
 	micSource: string; // "" = default
 	monitorSource: string; // "" = default sink monitor
@@ -26,6 +27,14 @@ export interface MTSettings {
 	summarize: boolean;
 	ollamaUrl: string;
 	ollamaModel: string;
+}
+
+/** Per-user data folder, outside any vault (keeps the Python env and audio out of sync/git). */
+export function dataDir(): string {
+	const home = os.homedir();
+	if (process.platform === "darwin") return path.join(home, "Library", "Application Support", "meeting-transcriber");
+	if (process.platform === "win32") return path.join(process.env.APPDATA ?? path.join(home, "AppData", "Roaming"), "meeting-transcriber");
+	return path.join(process.env.XDG_DATA_HOME ?? path.join(home, ".local", "share"), "meeting-transcriber");
 }
 
 function guessBin(name: string, candidates: string[]): string {
@@ -43,10 +52,11 @@ export const DEFAULT_SETTINGS: MTSettings = {
 	uvPath: guessBin("uv", [path.join(os.homedir(), ".local/bin/uv"), "/usr/local/bin/uv", "/usr/bin/uv"]),
 	ffmpegPath: guessBin("ffmpeg", ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"]),
 	backendPort: 8765,
+	backendDir: path.join(dataDir(), "backend"),
 	backendIdleMinutes: 10,
 	micSource: "",
 	monitorSource: "",
-	audioDir: path.join(os.homedir(), ".local/share/meeting-transcriber"),
+	audioDir: path.join(dataDir(), "recordings"),
 	keepAudio: false,
 	outputMode: "new-note",
 	notesFolder: "Meetings",
@@ -157,6 +167,10 @@ export class MTSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("ffmpeg path")
 			.addText((t) => t.setValue(s.ffmpegPath).onChange(async (v) => { s.ffmpegPath = v.trim(); await save(); }));
+		new Setting(containerEl)
+			.setName("Backend folder")
+			.setDesc("Where the Python server and its environment (several GB: PyTorch, models' code) are installed.")
+			.addText((t) => t.setValue(s.backendDir).onChange(async (v) => { s.backendDir = v.trim(); await save(); }));
 		new Setting(containerEl)
 			.setName("Port")
 			.addText((t) => t.setValue(String(s.backendPort)).onChange(async (v) => { s.backendPort = parseInt(v) || 8765; await save(); }));

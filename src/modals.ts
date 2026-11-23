@@ -15,7 +15,7 @@ export class TitleModal extends Modal {
 	onOpen(): void {
 		this.setTitle("Meeting title");
 		new Setting(this.contentEl).setName("Title (optional)").addText((t) => {
-			t.setPlaceholder("e.g. Réunion Edwin").onChange((v) => (this.value = v));
+			t.setPlaceholder("e.g. Weekly sync").onChange((v) => (this.value = v));
 			t.inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); this.submit(); } });
 			window.setTimeout(() => t.inputEl.focus(), 50);
 		});

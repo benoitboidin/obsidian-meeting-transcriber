@@ -12,5 +12,6 @@ const ctx = await esbuild.context({
   sourcemap: prod ? false : "inline",
   treeShaking: true,
   outfile: "main.js",
+  loader: { ".py": "text", ".toml": "text" },
 });
 if (prod) { await ctx.rebuild(); process.exit(0); } else { await ctx.watch(); }

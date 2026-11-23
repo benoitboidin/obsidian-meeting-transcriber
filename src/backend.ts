@@ -1,6 +1,27 @@
 import { requestUrl } from "obsidian";
 import { ChildProcess, spawn } from "child_process";
+import * as fs from "fs";
+import * as path from "path";
 import type { MTSettings } from "./settings";
+// Bundled as text by esbuild so the community-store install (main.js only) is self-contained.
+import PIPELINE_PY from "../backend/pipeline.py";
+import SERVER_PY from "../backend/server.py";
+import PYPROJECT from "../backend/pyproject.toml";
+
+const BACKEND_FILES: Record<string, string> = {
+	"pipeline.py": PIPELINE_PY,
+	"server.py": SERVER_PY,
+	"pyproject.toml": PYPROJECT,
+};
+
+/** Writes the bundled backend sources into `dir` when missing or outdated. */
+function installBackendFiles(dir: string): void {
+	fs.mkdirSync(dir, { recursive: true });
+	for (const [name, content] of Object.entries(BACKEND_FILES)) {
+		const p = path.join(dir, name);
+		if (!fs.existsSync(p) || fs.readFileSync(p, "utf8") !== content) fs.writeFileSync(p, content);
+	}
+}
 
 export interface Segment {
 	start: number;
@@ -36,7 +57,11 @@ export class Backend {
 	private idleTimer: number | null = null;
 	private starting: Promise<Health> | null = null;
 
-	constructor(private backendDir: string, private settings: () => MTSettings) {}
+	constructor(private settings: () => MTSettings) {}
+
+	private get backendDir(): string {
+		return this.settings().backendDir;
+	}
 
 	private get base(): string {
 		return `http://127.0.0.1:${this.settings().backendPort}`;
@@ -62,6 +87,7 @@ export class Backend {
 		if (h) return h; // already running (ours or started manually)
 
 		const s = this.settings();
+		installBackendFiles(this.backendDir);
 		this.log = "";
 		const env = { ...process.env } as Record<string, string>;
 		if (s.hfToken) env.HF_TOKEN = s.hfToken;
@@ -73,7 +99,7 @@ export class Backend {
 		const onData = (d: Buffer) => { this.log = (this.log + d.toString()).slice(-4000); };
 		proc.stdout?.on("data", onData);
 		proc.stderr?.on("data", onData);
-		let exited: string | null = null;
+		let exited = null as string | null;
 		proc.once("error", (e) => { exited = e.message; });
 		proc.once("exit", (code) => { exited = `exit code ${code}`; this.proc = null; });
 		this.proc = proc;
@@ -81,7 +107,10 @@ export class Backend {
 		// First launch may install dependencies (uv sync) → allow a long time.
 		const deadline = Date.now() + 15 * 60 * 1000;
 		while (Date.now() < deadline) {
-			if (exited) throw new Error(`Backend failed to start (${exited}):\n${this.log.slice(-1500)}`);
+			if (exited) {
+				const hint = exited.includes("ENOENT") ? ` — is uv installed? (https://docs.astral.sh/uv/) Set its path in settings.` : "";
+				throw new Error(`Backend failed to start (${exited})${hint}\n${this.log.slice(-1500)}`);
+			}
 			const h2 = await this.health();
 			if (h2) return h2;
 			await sleep(1000);

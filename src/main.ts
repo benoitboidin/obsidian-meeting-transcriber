@@ -20,8 +20,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
 	async onload(): Promise<void> {
 		await this.loadSettings();
 		const vaultBase = this.vaultBase();
-		const pluginDir = fs.realpathSync(path.join(vaultBase, this.manifest.dir ?? ""));
-		this.backend = new Backend(path.join(pluginDir, "backend"), () => this.settings);
+		this.backend = new Backend(() => this.settings);
 		this.recorder = new Recorder(() => this.settings.ffmpegPath);
 
 		this.statusEl = this.addStatusBarItem();
@@ -87,6 +86,10 @@ export default class MeetingTranscriberPlugin extends Plugin {
 
 	private async toggle(mode: RecordingMode): Promise<void> {
 		if (this.recorder.isRecording) return this.stopRecording();
+		if (process.platform !== "linux") {
+			new Notice("Recording currently requires Linux (PipeWire/PulseAudio). You can still use “Transcribe an audio/video file”.", 8000);
+			return;
+		}
 		try {
 			await this.recorder.start(mode, this.settings.audioDir, this.settings.micSource, this.settings.monitorSource);
 		} catch (e) {
