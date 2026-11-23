@@ -1,0 +1,9 @@
+{
+  "id": "meeting-transcriber",
+  "name": "Meeting Transcriber",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Record online and in-person meetings and insert a local, diarized transcript and summary (faster-whisper, pyannote, Ollama).",
+  "author": "Benoît",
+  "isDesktopOnly": true
+}

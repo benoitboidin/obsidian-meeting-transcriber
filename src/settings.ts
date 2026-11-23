@@ -1,0 +1,182 @@
+import { App, Notice, PluginSettingTab, Setting } from "obsidian";
+import * as os from "os";
+import * as path from "path";
+import * as fs from "fs";
+import type MeetingTranscriberPlugin from "./main";
+import { listSources } from "./recorder";
+
+export interface MTSettings {
+	myName: string;
+	language: string; // "" = auto
+	whisperModel: string;
+	hfToken: string;
+	minSpeakers: number; // 0 = auto
+	maxSpeakers: number; // 0 = auto
+	uvPath: string;
+	ffmpegPath: string;
+	backendPort: number;
+	backendIdleMinutes: number; // 0 = never stop
+	micSource: string; // "" = default
+	monitorSource: string; // "" = default sink monitor
+	audioDir: string;
+	keepAudio: boolean;
+	outputMode: "new-note" | "cursor";
+	notesFolder: string;
+	collapseTranscript: boolean;
+	summarize: boolean;
+	ollamaUrl: string;
+	ollamaModel: string;
+}
+
+function guessBin(name: string, candidates: string[]): string {
+	for (const c of candidates) if (fs.existsSync(c)) return c;
+	return name;
+}
+
+export const DEFAULT_SETTINGS: MTSettings = {
+	myName: "Me",
+	language: "",
+	whisperModel: "large-v3",
+	hfToken: "",
+	minSpeakers: 0,
+	maxSpeakers: 0,
+	uvPath: guessBin("uv", [path.join(os.homedir(), ".local/bin/uv"), "/usr/local/bin/uv", "/usr/bin/uv"]),
+	ffmpegPath: guessBin("ffmpeg", ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"]),
+	backendPort: 8765,
+	backendIdleMinutes: 10,
+	micSource: "",
+	monitorSource: "",
+	audioDir: path.join(os.homedir(), ".local/share/meeting-transcriber"),
+	keepAudio: false,
+	outputMode: "new-note",
+	notesFolder: "Meetings",
+	collapseTranscript: true,
+	summarize: true,
+	ollamaUrl: "http://127.0.0.1:11434",
+	ollamaModel: "qwen3.5:9b",
+};
+
+export class MTSettingTab extends PluginSettingTab {
+	constructor(app: App, private plugin: MeetingTranscriberPlugin) {
+		super(app, plugin);
+	}
+
+	async display(): Promise<void> {
+		const { containerEl } = this;
+		const s = this.plugin.settings;
+		const save = () => this.plugin.saveSettings();
+		containerEl.empty();
+
+		new Setting(containerEl).setName("Transcription").setHeading();
+		new Setting(containerEl)
+			.setName("Your name")
+			.setDesc("Used to label your microphone track in online meetings.")
+			.addText((t) => t.setValue(s.myName).onChange(async (v) => { s.myName = v.trim() || "Me"; await save(); }));
+		new Setting(containerEl)
+			.setName("Language")
+			.setDesc("Leave on auto-detect for mixed FR/EN use.")
+			.addDropdown((d) => d
+				.addOptions({ "": "Auto-detect", fr: "Français", en: "English", de: "Deutsch", es: "Español", it: "Italiano" })
+				.setValue(s.language)
+				.onChange(async (v) => { s.language = v; await save(); }));
+		new Setting(containerEl)
+			.setName("Whisper model")
+			.setDesc("large-v3 = best accuracy; large-v3-turbo = ~3× faster, slightly less accurate.")
+			.addDropdown((d) => d
+				.addOptions({ "large-v3": "large-v3", "large-v3-turbo": "large-v3-turbo", medium: "medium", small: "small" })
+				.setValue(s.whisperModel)
+				.onChange(async (v) => { s.whisperModel = v; await save(); }));
+		new Setting(containerEl)
+			.setName("HuggingFace token")
+			.setDesc("Needed once to download pyannote diarization. Accept the terms of pyannote/speaker-diarization-community-1 on huggingface.co first.")
+			.addText((t) => {
+				t.inputEl.type = "password";
+				t.setPlaceholder("hf_…").setValue(s.hfToken).onChange(async (v) => { s.hfToken = v.trim(); await save(); });
+			});
+		new Setting(containerEl)
+			.setName("Speakers (min / max)")
+			.setDesc("0 = let the model decide. Setting the exact number improves diarization.")
+			.addText((t) => t.setValue(String(s.minSpeakers)).onChange(async (v) => { s.minSpeakers = parseInt(v) || 0; await save(); }))
+			.addText((t) => t.setValue(String(s.maxSpeakers)).onChange(async (v) => { s.maxSpeakers = parseInt(v) || 0; await save(); }));
+
+		new Setting(containerEl).setName("Recording").setHeading();
+		let sources: string[] = [];
+		try { sources = await listSources(); } catch { /* pw-dump missing */ }
+		const srcOptions = (label: string) => {
+			const o: Record<string, string> = { "": label };
+			for (const x of sources) o[x] = x;
+			return o;
+		};
+		new Setting(containerEl)
+			.setName("Microphone")
+			.addDropdown((d) => d.addOptions(srcOptions("System default"))
+				.setValue(s.micSource).onChange(async (v) => { s.micSource = v; await save(); }));
+		new Setting(containerEl)
+			.setName("System audio (remote participants)")
+			.setDesc("A '.monitor' source of your output device.")
+			.addDropdown((d) => d.addOptions(srcOptions("Monitor of default output"))
+				.setValue(s.monitorSource).onChange(async (v) => { s.monitorSource = v; await save(); }));
+		new Setting(containerEl)
+			.setName("Audio folder")
+			.setDesc("Where recordings are written (kept outside the vault so obsidian-git ignores them).")
+			.addText((t) => t.setValue(s.audioDir).onChange(async (v) => { s.audioDir = v.trim(); await save(); }));
+		new Setting(containerEl)
+			.setName("Keep audio after transcription")
+			.addToggle((t) => t.setValue(s.keepAudio).onChange(async (v) => { s.keepAudio = v; await save(); }));
+
+		new Setting(containerEl).setName("Output").setHeading();
+		new Setting(containerEl)
+			.setName("Where to write")
+			.addDropdown((d) => d
+				.addOptions({ "new-note": "New note in meetings folder", cursor: "At cursor in active note" })
+				.setValue(s.outputMode)
+				.onChange(async (v) => { s.outputMode = v as MTSettings["outputMode"]; await save(); }));
+		new Setting(containerEl)
+			.setName("Meetings folder")
+			.addText((t) => t.setValue(s.notesFolder).onChange(async (v) => { s.notesFolder = v.trim(); await save(); }));
+		new Setting(containerEl)
+			.setName("Collapse transcript")
+			.setDesc("Wrap the transcript in a folded callout.")
+			.addToggle((t) => t.setValue(s.collapseTranscript).onChange(async (v) => { s.collapseTranscript = v; await save(); }));
+
+		new Setting(containerEl).setName("Summary (Ollama)").setHeading();
+		new Setting(containerEl)
+			.setName("Generate summary")
+			.addToggle((t) => t.setValue(s.summarize).onChange(async (v) => { s.summarize = v; await save(); }));
+		new Setting(containerEl)
+			.setName("Ollama URL")
+			.addText((t) => t.setValue(s.ollamaUrl).onChange(async (v) => { s.ollamaUrl = v.trim(); await save(); }));
+		new Setting(containerEl)
+			.setName("Ollama model")
+			.addText((t) => t.setValue(s.ollamaModel).onChange(async (v) => { s.ollamaModel = v.trim(); await save(); }));
+
+		new Setting(containerEl).setName("Backend").setHeading();
+		new Setting(containerEl)
+			.setName("uv path")
+			.addText((t) => t.setValue(s.uvPath).onChange(async (v) => { s.uvPath = v.trim(); await save(); }));
+		new Setting(containerEl)
+			.setName("ffmpeg path")
+			.addText((t) => t.setValue(s.ffmpegPath).onChange(async (v) => { s.ffmpegPath = v.trim(); await save(); }));
+		new Setting(containerEl)
+			.setName("Port")
+			.addText((t) => t.setValue(String(s.backendPort)).onChange(async (v) => { s.backendPort = parseInt(v) || 8765; await save(); }));
+		new Setting(containerEl)
+			.setName("Stop backend after idle (minutes)")
+			.setDesc("Frees GPU memory. 0 = keep running while Obsidian is open.")
+			.addText((t) => t.setValue(String(s.backendIdleMinutes)).onChange(async (v) => { s.backendIdleMinutes = parseInt(v) || 0; await save(); }));
+		new Setting(containerEl)
+			.setName("Check backend")
+			.setDesc("Installs Python deps if needed (first time can take several minutes), starts the server and reports GPU.")
+			.addButton((b) => b.setButtonText("Check").onClick(async () => {
+				b.setDisabled(true).setButtonText("Starting…");
+				try {
+					const h = await this.plugin.backend.ensureRunning();
+					new Notice(`Backend OK — ${h.cuda ? "GPU: " + h.gpu : "CPU only (slow)"}`);
+				} catch (e) {
+					new Notice(`Backend error: ${(e as Error).message}`, 10000);
+				} finally {
+					b.setDisabled(false).setButtonText("Check");
+				}
+			}));
+	}
+}
