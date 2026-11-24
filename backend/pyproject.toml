@@ -2,7 +2,7 @@
 name = "meeting-transcriber-backend"
 version = "0.1.0"
 description = "Local transcription + diarization server for the Obsidian Meeting Transcriber plugin"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.29",

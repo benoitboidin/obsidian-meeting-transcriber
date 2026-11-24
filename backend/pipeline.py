@@ -35,6 +35,8 @@ Progress = Callable[[str, float], None]
 
 SR = 16000
 CHUNK_SEC = 30 * 60
+# The plugin passes the ffmpeg path it found (GUI apps may not have it on PATH).
+FFMPEG = os.environ.get("MT_FFMPEG") or "ffmpeg"
 # Cosine distance under which two speakers from different chunks are considered the same person.
 LINK_THRESHOLD = 0.5
 
@@ -74,11 +76,16 @@ def to_wav16k(path: str, tmpdir: str) -> str:
     if _is_wav16k_mono(path):
         return path
     out = os.path.join(tmpdir, os.path.basename(path) + ".16k.wav")
-    subprocess.run(
-        ["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-i", path,
-         "-vn", "-ac", "1", "-ar", str(SR), "-c:a", "pcm_s16le", out],
-        check=True,
-    )
+    try:
+        subprocess.run(
+            [FFMPEG, "-nostdin", "-y", "-loglevel", "error", "-i", path,
+             "-vn", "-ac", "1", "-ar", str(SR), "-c:a", "pcm_s16le", out],
+            check=True,
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"ffmpeg was not found (tried {FFMPEG!r}). Install it (macOS: brew install ffmpeg) "
+            "and set its path in the plugin settings.")
     return out
 
 
@@ -128,7 +135,44 @@ def free_gpu() -> None:
         torch.cuda.empty_cache()
 
 
+def pick_torch_device() -> torch.device:
+    """Best torch device for diarization: CUDA, then Apple Metal (MPS), then CPU."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 # --------------------------------------------------------------------------- ASR
+
+def pick_asr_device() -> str:
+    """CTranslate2 speaks CUDA and (experimentally) Apple Metal; otherwise CPU."""
+    if torch.cuda.is_available():
+        return "cuda"
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def load_whisper(model_name: str, device: str):
+    from faster_whisper import WhisperModel
+
+    if device == "cuda":
+        return WhisperModel(model_name, device="cuda", compute_type="float16")
+    if device == "mps":
+        try:
+            return WhisperModel(model_name, device="mps", compute_type="float16")
+        except Exception:
+            device = "cpu"  # experimental backend unavailable → fall through
+    try:
+        return WhisperModel(model_name, device="cpu", compute_type="int8")
+    except Exception:
+        # int8 is not available on every CPU (some ARM builds): fall back to fp32.
+        return WhisperModel(model_name, device="cpu", compute_type="float32")
+
 
 def transcribe(model, wav: Wav, chunks: list[tuple[float, float]], language: Optional[str],
                label: str, progress: Progress) -> tuple[list[Word], Optional[str]]:
@@ -159,11 +203,12 @@ def transcribe(model, wav: Wav, chunks: list[tuple[float, float]], language: Opt
 
 # --------------------------------------------------------------------- Diarize
 
-def load_diarizer(hf_token: Optional[str]):
+def load_diarizer(hf_token: Optional[str], device: Optional[torch.device] = None):
     from pyannote.audio import Pipeline
 
     if not hf_token:
         raise RuntimeError("no HuggingFace token set in the plugin settings.")
+    target = device or torch.device("cpu")
     first_err: Exception | None = None
     for name in ("pyannote/speaker-diarization-community-1",
                  "pyannote/speaker-diarization-3.1"):
@@ -171,8 +216,10 @@ def load_diarizer(hf_token: Optional[str]):
             pipe = Pipeline.from_pretrained(name, token=hf_token)
             if pipe is None:
                 raise RuntimeError(f"could not load {name}")
-            if torch.cuda.is_available():
-                pipe.to(torch.device("cuda"))
+            try:
+                pipe.to(target)
+            except Exception:  # some backends lack ops used by the pipeline
+                pipe.to(torch.device("cpu"))
             return pipe
         except Exception as e:  # try the fallback model
             first_err = first_err or e
@@ -353,10 +400,7 @@ def run(mic: str, system: Optional[str] = None, me: str = "Me",
         whisper_model: str = "large-v3", min_speakers: Optional[int] = None,
         max_speakers: Optional[int] = None, progress: Progress = _noop,
         chunk_sec: float = CHUNK_SEC) -> dict:
-    from faster_whisper import WhisperModel
-
     hf_token = hf_token or os.environ.get("HF_TOKEN")
-    cuda = torch.cuda.is_available()
     warnings: list[str] = []
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -367,27 +411,50 @@ def run(mic: str, system: Optional[str] = None, me: str = "Me",
         sys_chunks = plan_chunks(sys_wav, chunk_sec) if sys_wav else []
         duration = max(mic_wav.duration, sys_wav.duration if sys_wav else 0.0)
 
-        progress("loading whisper", 0.0)
-        model = WhisperModel(whisper_model, device="cuda" if cuda else "cpu",
-                             compute_type="float16" if cuda else "int8")
-        mic_words, lang = transcribe(model, mic_wav, mic_chunks, language,
-                                     "your mic" if sys_wav else "audio", progress)
-        sys_words: list[Word] = []
-        if sys_wav:
-            sys_words, sys_lang = transcribe(model, sys_wav, sys_chunks, language or lang,
-                                             "remote audio", progress)
-            if sys_lang and len(sys_words) >= len(mic_words):
-                lang = sys_lang
-        del model
-        free_gpu()
+        def run_asr(device: str) -> tuple[list[Word], list[Word], Optional[str]]:
+            progress("loading whisper", 0.0)
+            model = load_whisper(whisper_model, device)
+            try:
+                mic_words, lang = transcribe(model, mic_wav, mic_chunks, language,
+                                             "your mic" if sys_wav else "audio", progress)
+                remote: list[Word] = []
+                if sys_wav:
+                    remote, sys_lang = transcribe(model, sys_wav, sys_chunks, language or lang,
+                                                  "remote audio", progress)
+                    if sys_lang and len(remote) >= len(mic_words):
+                        lang = sys_lang
+                return mic_words, remote, lang
+            finally:
+                del model
+                free_gpu()
+
+        asr_device = pick_asr_device()
+        try:
+            mic_words, sys_words, lang = run_asr(asr_device)
+        except Exception as e:
+            if asr_device != "mps":
+                raise
+            warnings.append(f"Apple Metal transcription failed, retried on CPU: {e}")
+            mic_words, sys_words, lang = run_asr("cpu")
 
         # Track that needs diarization: system (online) or mic (in-person / file)
         words, wav, chunks = (sys_words, sys_wav, sys_chunks) if sys_wav else (mic_words, mic_wav, mic_chunks)
         if words:
             progress("identifying speakers", 0.0)
+            turns: list[tuple[float, float, str]] = []
+            diar_device = pick_torch_device()
             try:
-                pipe = load_diarizer(hf_token)
-                turns = diarize(pipe, wav, chunks, min_speakers, max_speakers, progress)
+                pipe = load_diarizer(hf_token, diar_device)
+                try:
+                    turns = diarize(pipe, wav, chunks, min_speakers, max_speakers, progress)
+                except Exception:
+                    if diar_device.type != "mps":
+                        raise
+                    # MPS can lack ops used by pyannote: retry this pipeline on CPU.
+                    del pipe
+                    free_gpu()
+                    pipe = load_diarizer(hf_token, torch.device("cpu"))
+                    turns = diarize(pipe, wav, chunks, min_speakers, max_speakers, progress)
                 del pipe
             except Exception as e:  # keep the transcript even if diarization fails
                 warnings.append(f"Diarization skipped: {e}")
