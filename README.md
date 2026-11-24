@@ -40,7 +40,8 @@ This plugin drives local programs; it is **desktop-only**.
 |---|---|
 | [uv](https://docs.astral.sh/uv/) | Installs and runs the Python transcription server |
 | [ffmpeg](https://ffmpeg.org) | Recording and audio conversion |
-| **Linux with PipeWire or PulseAudio** | Recording (mic + system audio). On macOS/Windows only *Transcribe an audio/video file* works for now. |
+| **Linux with PipeWire or PulseAudio** | Recording on Linux (mic + system audio). |
+| **macOS 14+ (Apple Silicon)** | Recording on macOS (see below). *Transcribe an audio/video file* also works on Intel Macs except for the PyTorch diarization step. |
 | NVIDIA GPU (recommended) | A few minutes per hour of audio; CPU works but is much slower |
 | [Ollama](https://ollama.com) (optional) | Summaries |
 | HuggingFace account (free) | One-time download of the pyannote diarization model |
@@ -51,6 +52,17 @@ This plugin drives local programs; it is **desktop-only**.
 2. Install `uv` and `ffmpeg`; optionally Ollama and `ollama pull qwen3.5:9b`.
 3. On huggingface.co, accept the terms of [pyannote/speaker-diarization-community-1](https://hf.co/pyannote/speaker-diarization-community-1), create a *read* token, and paste it in the plugin settings. Without it you still get transcripts, but all speakers are `SPEAKER_00`.
 4. Set **Your name** in settings, then click **Check backend**. The first run installs the Python environment (PyTorch etc., a few GB) and can take several minutes.
+
+### macOS
+
+macOS cannot capture system audio without a loopback device, so online meetings need [BlackHole](https://existential.audio/blackhole/):
+
+1. `brew install --cask blackhole-2ch`
+2. In **Audio MIDI Setup**, create a **Multi-Output Device** with your speakers/headphones **and** BlackHole 2ch, then select it as the system output (so you still hear the meeting).
+3. Grant Obsidian **Microphone** and **Screen & System Audio Recording** access in **System Settings → Privacy & Security**.
+4. Reload the plugin settings and click **Re-detect** next to *Detected binaries* and under *Recording*: the mic and the BlackHole loopback should appear.
+
+In-person meetings only need the microphone. Both transcription and diarization can use the Apple GPU (MPS, experimental in ctranslate2/pyannote) when available, falling back to CPU automatically. Prefer `large-v3-turbo` or `medium` on laptops.
 
 ## Usage
 
@@ -68,7 +80,7 @@ Tips: use headphones in online meetings for the cleanest separation; setting the
 
 ## Disclosures
 
-- **External programs:** the plugin runs `ffmpeg` (recording/conversion), `pw-dump` (listing audio devices) and `uv`, which starts a Python server bundled in the plugin. The server's source is written to the backend folder (default `~/.local/share/meeting-transcriber/backend`) and listens on `127.0.0.1` only.
+- **External programs:** the plugin runs `ffmpeg` (recording/conversion), `pw-dump` (listing audio devices, Linux) and `uv`, which starts a Python server bundled in the plugin. The server's source is written to the backend folder (default `~/.local/share/meeting-transcriber/backend`) and listens on `127.0.0.1` only.
 - **Network use:** on first run, `uv` downloads Python packages from PyPI, and the server downloads model weights from HuggingFace (using your token for pyannote). Summaries call your Ollama server (default `http://127.0.0.1:11434`). **No audio, transcript or note content is sent to any remote service** by this plugin, and there is no telemetry.
 - **Files outside the vault:** recordings are stored in `~/.local/share/meeting-transcriber/recordings` (deleted after transcription unless *Keep audio* is on); the Python environment lives in the backend folder. Both paths are configurable.
 - **Consent:** recording people may require their consent depending on where you live. You are responsible for informing participants.
