@@ -81,7 +81,7 @@ export class Backend {
 		return this.starting;
 	}
 
-	private async start(): Promise<Health> {
+	private async start(useSystemdScope = process.platform === "linux"): Promise<Health> {
 		this.clearIdle();
 		const h = await this.health();
 		if (h) return h; // already running (ours or started manually)
@@ -91,11 +91,13 @@ export class Backend {
 		this.log = "";
 		const env = { ...process.env } as Record<string, string>;
 		if (s.hfToken) env.HF_TOKEN = s.hfToken;
-		const proc = spawn(
-			s.uvPath,
-			["run", "--project", this.backendDir, "python", "server.py", "--port", String(s.backendPort)],
-			{ cwd: this.backendDir, env, detached: true, stdio: ["ignore", "pipe", "pipe"] },
-		);
+		const cmd = [s.uvPath, "run", "--project", this.backendDir, "python", "server.py", "--port", String(s.backendPort)];
+		// On systemd Linux, run the backend in its own scope: if it ever runs out of memory,
+		// the OOM killer stops the backend only, not Obsidian.
+		const scoped = useSystemdScope && fs.existsSync("/usr/bin/systemd-run");
+		const argv = scoped ? ["/usr/bin/systemd-run", "--user", "--scope", "--quiet", "--collect", ...cmd] : cmd;
+		const proc = spawn(argv[0], argv.slice(1),
+			{ cwd: this.backendDir, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
 		const onData = (d: Buffer) => { this.log = (this.log + d.toString()).slice(-4000); };
 		proc.stdout?.on("data", onData);
 		proc.stderr?.on("data", onData);
@@ -107,6 +109,10 @@ export class Backend {
 		// First launch may install dependencies (uv sync) → allow a long time.
 		const deadline = Date.now() + 15 * 60 * 1000;
 		while (Date.now() < deadline) {
+			if (exited && scoped && this.log.includes("systemd-run")) {
+				// No user systemd session available → retry without the scope.
+				return this.start(false);
+			}
 			if (exited) {
 				const hint = exited.includes("ENOENT") ? ` — is uv installed? (https://docs.astral.sh/uv/) Set its path in settings.` : "";
 				throw new Error(`Backend failed to start (${exited})${hint}\n${this.log.slice(-1500)}`);

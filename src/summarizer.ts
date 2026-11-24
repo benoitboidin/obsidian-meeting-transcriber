@@ -74,7 +74,23 @@ export async function summarize(
 		partials.push(await chat(s, system,
 			`This is part ${i + 1} of ${parts.length} of a meeting transcript. Write detailed notes of this part: key points, decisions, action items with owners.\n\nTranscript part:\n${parts[i]}`));
 	}
+	// Very long meetings: condense groups of notes until they fit in one final call.
+	let notes = partials.map((p, i) => `--- Part ${i + 1} ---\n${p}`);
+	for (let round = 1; notes.join("\n\n").length > CHUNK_CHARS && notes.length > 1; round++) {
+		const groups: string[][] = [[]];
+		for (const n of notes) {
+			const g = groups[groups.length - 1];
+			if (g.length && (g.join("\n\n").length + n.length > CHUNK_CHARS)) groups.push([n]); else g.push(n);
+		}
+		const next: string[] = [];
+		for (let i = 0; i < groups.length; i++) {
+			onProgress?.(`Condensing notes (round ${round}, ${i + 1}/${groups.length})…`);
+			next.push(`--- Section ${i + 1} ---\n` + await chat(s, system,
+				`Below are notes on consecutive parts of one meeting. Merge them into shorter notes, keeping every decision and action item with its owner.\n\n${groups[i].join("\n\n")}`));
+		}
+		notes = next;
+	}
 	onProgress?.("Merging summaries…");
 	return chat(s, system,
-		`Below are notes on consecutive parts of one meeting. Merge them into final minutes.\n${SECTIONS}\n\n${partials.map((p, i) => `--- Part ${i + 1} ---\n${p}`).join("\n\n")}`);
+		`Below are notes on consecutive parts of one meeting. Merge them into final minutes.\n${SECTIONS}\n\n${notes.join("\n\n")}`);
 }
