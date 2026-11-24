@@ -56,8 +56,12 @@ def _worker(job_id: str, req: JobRequest) -> None:
 
 @app.get("/health")
 def health():
-    return {"ok": True, "cuda": pipeline.torch.cuda.is_available(),
-            "gpu": pipeline.torch.cuda.get_device_name(0) if pipeline.torch.cuda.is_available() else None}
+    torch = pipeline.torch
+    cuda = torch.cuda.is_available()
+    mps = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
+    return {"ok": True, "cuda": cuda, "mps": mps,
+            "device": "cuda" if cuda else "mps" if mps else "cpu",
+            "gpu": torch.cuda.get_device_name(0) if cuda else None}
 
 
 @app.post("/jobs")
