@@ -1,6 +1,7 @@
 import { requestUrl } from "obsidian";
 import { ChildProcess, spawn } from "child_process";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import type { MTSettings } from "./settings";
 // Bundled as text by esbuild so the community-store install (main.js only) is self-contained.
@@ -40,7 +41,36 @@ export interface TranscriptResult {
 export interface Health {
 	ok: boolean;
 	cuda: boolean;
+	mps?: boolean;
+	device?: "cuda" | "mps" | "cpu";
 	gpu: string | null;
+}
+
+function binDirs(bin: string): string[] {
+	return bin.includes("/") || bin.includes("\\") ? [path.dirname(bin)] : [];
+}
+
+/** PATH for the backend: GUI apps on macOS start with a minimal PATH that misses Homebrew and ~/.local/bin. */
+function backendPath(s: MTSettings): string {
+	const extra = [
+		...binDirs(s.uvPath),
+		...binDirs(s.ffmpegPath),
+		path.join(os.homedir(), ".local", "bin"),
+		"/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin",
+	];
+	const current = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
+	return [...new Set([...extra, ...current])].join(path.delimiter);
+}
+
+/** Absolute path for a configured binary (or its first match on `envPath`). */
+function resolveExecutable(bin: string, envPath: string): string | null {
+	if (bin.includes("/") || bin.includes("\\")) return fs.existsSync(bin) ? bin : null;
+	for (const dir of envPath.split(path.delimiter)) {
+		if (!dir) continue;
+		const p = path.join(dir, bin);
+		if (fs.existsSync(p)) return p;
+	}
+	return null;
 }
 
 export interface JobInput {
@@ -90,8 +120,18 @@ export class Backend {
 		installBackendFiles(this.backendDir);
 		this.log = "";
 		const env = { ...process.env } as Record<string, string>;
+		env.PATH = backendPath(s);
+		const uv = resolveExecutable(s.uvPath, env.PATH);
+		if (!uv) {
+			throw new Error(`uv was not found at "${s.uvPath}". Install it (macOS: brew install uv) and set its path in settings.`);
+		}
+		const ffmpeg = resolveExecutable(s.ffmpegPath, env.PATH);
+		if (!ffmpeg) {
+			throw new Error(`ffmpeg was not found at "${s.ffmpegPath}". Install it (macOS: brew install ffmpeg) and set its path in settings.`);
+		}
+		env.MT_FFMPEG = ffmpeg;
 		if (s.hfToken) env.HF_TOKEN = s.hfToken;
-		const cmd = [s.uvPath, "run", "--project", this.backendDir, "python", "server.py", "--port", String(s.backendPort)];
+		const cmd = [uv, "run", "--project", this.backendDir, "python", "server.py", "--port", String(s.backendPort)];
 		// On systemd Linux, run the backend in its own scope: if it ever runs out of memory,
 		// the OOM killer stops the backend only, not Obsidian.
 		const scoped = useSystemdScope && fs.existsSync("/usr/bin/systemd-run");
