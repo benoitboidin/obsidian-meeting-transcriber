@@ -3,7 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import * as fs from "fs";
 import type MeetingTranscriberPlugin from "./main";
-import { listSources } from "./recorder";
+import { listSources, type AudioSource } from "./recorder";
 
 export interface MTSettings {
 	myName: string;
@@ -37,9 +37,26 @@ export function dataDir(): string {
 	return path.join(process.env.XDG_DATA_HOME ?? path.join(home, ".local", "share"), "meeting-transcriber");
 }
 
-function guessBin(name: string, candidates: string[]): string {
-	for (const c of candidates) if (fs.existsSync(c)) return c;
+/** Directories where Homebrew / user-installed tools live but Obsidian's GUI PATH usually misses. */
+function binDirs(): string[] {
+	const home = os.homedir();
+	return ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", path.join(home, ".local", "bin"), "/usr/bin", "/bin"];
+}
+
+/** Absolute path of `name` if one of the well-known locations contains it, else `name` (PATH lookup). */
+export function findBin(name: string): string {
+	for (const d of binDirs()) {
+		const c = path.join(d, name);
+		if (fs.existsSync(c)) return c;
+	}
 	return name;
+}
+
+/** Keeps a configured binary if it still exists, otherwise re-detects it. */
+export function resolveBinary(configured: string, name: string): string {
+	const isPath = configured.includes("/") || configured.includes("\\");
+	if (isPath && fs.existsSync(configured)) return configured;
+	return findBin(name);
 }
 
 export const DEFAULT_SETTINGS: MTSettings = {
@@ -49,8 +66,8 @@ export const DEFAULT_SETTINGS: MTSettings = {
 	hfToken: "",
 	minSpeakers: 0,
 	maxSpeakers: 0,
-	uvPath: guessBin("uv", [path.join(os.homedir(), ".local/bin/uv"), "/usr/local/bin/uv", "/usr/bin/uv"]),
-	ffmpegPath: guessBin("ffmpeg", ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"]),
+	uvPath: findBin("uv"),
+	ffmpegPath: findBin("ffmpeg"),
 	backendPort: 8765,
 	backendDir: path.join(dataDir(), "backend"),
 	backendIdleMinutes: 10,
@@ -110,21 +127,34 @@ export class MTSettingTab extends PluginSettingTab {
 			.addText((t) => t.setValue(String(s.maxSpeakers)).onChange(async (v) => { s.maxSpeakers = parseInt(v) || 0; await save(); }));
 
 		new Setting(containerEl).setName("Recording").setHeading();
-		let sources: string[] = [];
-		try { sources = await listSources(); } catch { /* pw-dump missing */ }
-		const srcOptions = (label: string) => {
+		const isMac = process.platform === "darwin";
+		if (isMac) {
+			new Setting(containerEl)
+				.setName("macOS system audio")
+				.setDesc("System audio needs a loopback device: install BlackHole 2ch (`brew install --cask blackhole-2ch`), then create a Multi-Output Device with your speakers + BlackHole in Audio MIDI Setup and use it as output. Grant Obsidian microphone and Screen & System Audio Recording permissions. macOS records the mic only unless a loopback device is present.")
+				.addButton((b) => b.setButtonText("Re-detect").onClick(() => this.display()));
+		}
+		let sources: AudioSource[] = [];
+		try { sources = await listSources(s.ffmpegPath); } catch { /* ffmpeg missing */ }
+		const srcOptions = (kind: AudioSource["kind"], label: string) => {
 			const o: Record<string, string> = { "": label };
-			for (const x of sources) o[x] = x;
+			for (const x of sources) if (x.kind === kind) o[x.name] = x.name;
 			return o;
 		};
+		const loopbackMissing = isMac && !sources.some((x) => x.kind === "monitor");
 		new Setting(containerEl)
 			.setName("Microphone")
-			.addDropdown((d) => d.addOptions(srcOptions("System default"))
+			.setDesc(isMac ? "Input device used for your own voice." : "")
+			.addDropdown((d) => d.addOptions(srcOptions("mic", "System default"))
 				.setValue(s.micSource).onChange(async (v) => { s.micSource = v; await save(); }));
 		new Setting(containerEl)
 			.setName("System audio (remote participants)")
-			.setDesc("A '.monitor' source of your output device.")
-			.addDropdown((d) => d.addOptions(srcOptions("Monitor of default output"))
+			.setDesc(isMac
+				? (loopbackMissing
+					? "⚠️ No loopback input found — install BlackHole 2ch to record online meetings."
+					: "Your BlackHole/loopback input device.")
+				: "A '.monitor' source of your output device.")
+			.addDropdown((d) => d.addOptions(srcOptions("monitor", isMac ? "Default loopback" : "Monitor of default output"))
 				.setValue(s.monitorSource).onChange(async (v) => { s.monitorSource = v; await save(); }));
 		new Setting(containerEl)
 			.setName("Audio folder")
@@ -168,6 +198,15 @@ export class MTSettingTab extends PluginSettingTab {
 			.setName("ffmpeg path")
 			.addText((t) => t.setValue(s.ffmpegPath).onChange(async (v) => { s.ffmpegPath = v.trim(); await save(); }));
 		new Setting(containerEl)
+			.setName("Detected binaries")
+			.setDesc(`uv: ${s.uvPath}\nffmpeg: ${s.ffmpegPath}`)
+			.addButton((b) => b.setButtonText("Re-detect").onClick(async () => {
+				s.uvPath = findBin("uv");
+				s.ffmpegPath = findBin("ffmpeg");
+				await save();
+				this.display();
+			}));
+		new Setting(containerEl)
 			.setName("Backend folder")
 			.setDesc("Where the Python server and its environment (several GB: PyTorch, models' code) are installed.")
 			.addText((t) => t.setValue(s.backendDir).onChange(async (v) => { s.backendDir = v.trim(); await save(); }));
@@ -185,7 +224,8 @@ export class MTSettingTab extends PluginSettingTab {
 				b.setDisabled(true).setButtonText("Starting…");
 				try {
 					const h = await this.plugin.backend.ensureRunning();
-					new Notice(`Backend OK — ${h.cuda ? "GPU: " + h.gpu : "CPU only (slow)"}`);
+					const perf = h.cuda ? `GPU: ${h.gpu}` : h.mps ? "Apple GPU (MPS, experimental)" : "CPU only (slow)";
+					new Notice(`Backend OK — ${perf}`);
 				} catch (e) {
 					new Notice(`Backend error: ${(e as Error).message}`, 10000);
 				} finally {
