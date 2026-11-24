@@ -5,7 +5,7 @@ import { Backend, TranscriptResult } from "./backend";
 import { askTitle, MediaPickerModal, RenameSpeakersModal } from "./modals";
 import { hms, plainTranscript, transcriptFromNote, writeResult } from "./noteWriter";
 import { Recorder, RecordingMode } from "./recorder";
-import { DEFAULT_SETTINGS, MTSettings, MTSettingTab } from "./settings";
+import { DEFAULT_SETTINGS, MTSettings, MTSettingTab, resolveBinary } from "./settings";
 import { summarize } from "./summarizer";
 
 export default class MeetingTranscriberPlugin extends Plugin {
@@ -76,6 +76,14 @@ export default class MeetingTranscriberPlugin extends Plugin {
 
 	async loadSettings(): Promise<void> {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		// Saved settings may point at a binary that no longer exists (or a bare name that the GUI PATH cannot find).
+		const uv = resolveBinary(this.settings.uvPath, "uv");
+		const ffmpeg = resolveBinary(this.settings.ffmpegPath, "ffmpeg");
+		if (uv !== this.settings.uvPath || ffmpeg !== this.settings.ffmpegPath) {
+			this.settings.uvPath = uv;
+			this.settings.ffmpegPath = ffmpeg;
+			await this.saveSettings();
+		}
 	}
 
 	async saveSettings(): Promise<void> {
@@ -86,14 +94,14 @@ export default class MeetingTranscriberPlugin extends Plugin {
 
 	private async toggle(mode: RecordingMode): Promise<void> {
 		if (this.recorder.isRecording) return this.stopRecording();
-		if (process.platform !== "linux") {
-			new Notice("Recording currently requires Linux (PipeWire/PulseAudio). You can still use “Transcribe an audio/video file”.", 8000);
+		if (process.platform !== "linux" && process.platform !== "darwin") {
+			new Notice("Recording is supported on Linux and macOS. You can still use “Transcribe an audio/video file”.", 8000);
 			return;
 		}
 		try {
 			await this.recorder.start(mode, this.settings.audioDir, this.settings.micSource, this.settings.monitorSource);
 		} catch (e) {
-			new Notice(`Could not start recording: ${(e as Error).message}`, 10000);
+			new Notice(`Could not start recording: ${(e as Error).message}`, 15000);
 			return;
 		}
 		this.recordTarget = this.settings.outputMode === "cursor" ? this.app.workspace.getActiveFile() : null;
