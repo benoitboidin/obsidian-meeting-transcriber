@@ -148,13 +148,8 @@ def pick_torch_device() -> torch.device:
 # --------------------------------------------------------------------------- ASR
 
 def pick_asr_device() -> str:
-    """CTranslate2 speaks CUDA and (experimentally) Apple Metal; otherwise CPU."""
-    if torch.cuda.is_available():
-        return "cuda"
-    mps = getattr(torch.backends, "mps", None)
-    if mps is not None and mps.is_available():
-        return "mps"
-    return "cpu"
+    """CTranslate2 (faster-whisper) runs on CUDA or CPU; the PyPI wheels have no Apple Metal support."""
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def load_whisper(model_name: str, device: str):
@@ -162,11 +157,6 @@ def load_whisper(model_name: str, device: str):
 
     if device == "cuda":
         return WhisperModel(model_name, device="cuda", compute_type="float16")
-    if device == "mps":
-        try:
-            return WhisperModel(model_name, device="mps", compute_type="float16")
-        except Exception:
-            device = "cpu"  # experimental backend unavailable → fall through
     try:
         return WhisperModel(model_name, device="cpu", compute_type="int8")
     except Exception:
@@ -428,14 +418,7 @@ def run(mic: str, system: Optional[str] = None, me: str = "Me",
                 del model
                 free_gpu()
 
-        asr_device = pick_asr_device()
-        try:
-            mic_words, sys_words, lang = run_asr(asr_device)
-        except Exception as e:
-            if asr_device != "mps":
-                raise
-            warnings.append(f"Apple Metal transcription failed, retried on CPU: {e}")
-            mic_words, sys_words, lang = run_asr("cpu")
+        mic_words, sys_words, lang = run_asr(pick_asr_device())
 
         # Track that needs diarization: system (online) or mic (in-person / file)
         words, wav, chunks = (sys_words, sys_wav, sys_chunks) if sys_wav else (mic_words, mic_wav, mic_chunks)

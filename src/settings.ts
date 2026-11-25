@@ -224,7 +224,7 @@ export class MTSettingTab extends PluginSettingTab {
 				b.setDisabled(true).setButtonText("Starting…");
 				try {
 					const h = await this.plugin.backend.ensureRunning();
-					const perf = h.cuda ? `GPU: ${h.gpu}` : h.mps ? "Apple GPU (MPS, experimental)" : "CPU only (slow)";
+					const perf = h.cuda ? `GPU: ${h.gpu}` : h.mps ? "transcription on CPU, speaker detection on Apple GPU (MPS)" : "CPU only (slow)";
 					new Notice(`Backend OK — ${perf}`);
 				} catch (e) {
 					new Notice(`Backend error: ${(e as Error).message}`, 10000);

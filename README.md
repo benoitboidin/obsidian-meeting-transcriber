@@ -62,7 +62,7 @@ macOS cannot capture system audio without a loopback device, so online meetings 
 3. Grant Obsidian **Microphone** and **Screen & System Audio Recording** access in **System Settings → Privacy & Security**.
 4. Reload the plugin settings and click **Re-detect** next to *Detected binaries* and under *Recording*: the mic and the BlackHole loopback should appear.
 
-In-person meetings only need the microphone. Both transcription and diarization can use the Apple GPU (MPS, experimental in ctranslate2/pyannote) when available, falling back to CPU automatically. Prefer `large-v3-turbo` or `medium` on laptops.
+In-person meetings only need the microphone. Transcription runs on the CPU on Macs (faster-whisper has no Apple GPU support); speaker detection uses the Apple GPU (MPS) when available and falls back to CPU automatically. Prefer `large-v3-turbo` or `medium` on Macs: `large-v3` on CPU is slow.
 
 ## Usage
 
