@@ -13,7 +13,7 @@ export class TitleModal extends Modal {
 	}
 
 	onOpen(): void {
-		this.setTitle("Meeting title");
+		this.titleEl.setText("Meeting title");
 		new Setting(this.contentEl).setName("Title (optional)").addText((t) => {
 			t.setPlaceholder("e.g. Weekly sync").onChange((v) => (this.value = v));
 			t.inputEl.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); this.submit(); } });
@@ -87,7 +87,7 @@ export class RenameSpeakersModal extends Modal {
 	}
 
 	onOpen(): void {
-		this.setTitle("Rename speakers");
+		this.titleEl.setText("Rename speakers");
 		for (const sp of this.speakers) {
 			new Setting(this.contentEl).setName(sp).addText((t) =>
 				t.setPlaceholder(sp).onChange((v) => this.names.set(sp, v.trim())));
@@ -110,8 +110,9 @@ export class RenameSpeakersModal extends Modal {
 		});
 		// frontmatter participants for non-generic names
 		await this.app.fileManager.processFrontMatter(this.file, (fm) => {
-			if (Array.isArray(fm.participants)) {
-				fm.participants = fm.participants.map((p: string) => map.find(([f]) => f === p)?.[1] ?? p);
+			const f = fm as { participants?: unknown };
+			if (Array.isArray(f.participants)) {
+				f.participants = f.participants.map((p: unknown) => map.find(([from]) => from === p)?.[1] ?? p);
 			}
 		});
 		new Notice(`Renamed ${map.length} speaker(s)`);

@@ -57,15 +57,14 @@ export default class MeetingTranscriberPlugin extends Plugin {
 		this.updateUi();
 	}
 
-	async onunload(): Promise<void> {
-		if (this.recorder.isRecording) {
-			try {
-				const rec = await this.recorder.stop();
-				new Notice(`Meeting recording stopped because the plugin was unloaded. Audio kept in ${rec.dir}`);
-			} catch { /* ignore */ }
-		}
+	onunload(): void {
 		this.stopTimer();
 		this.backend.stop();
+		if (this.recorder.isRecording) {
+			this.recorder.stop()
+				.then((rec) => new Notice(`Meeting recording stopped because the plugin was unloaded. Audio kept in ${rec.dir}`))
+				.catch(() => { /* already gone */ });
+		}
 	}
 
 	private vaultBase(): string {
@@ -75,7 +74,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
 	}
 
 	async loadSettings(): Promise<void> {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, (await this.loadData()) as Partial<MTSettings> | null);
 		// Saved settings may point at a binary that no longer exists (or a bare name that the GUI PATH cannot find).
 		const uv = resolveBinary(this.settings.uvPath, "uv");
 		const ffmpeg = resolveBinary(this.settings.ffmpegPath, "ffmpeg");

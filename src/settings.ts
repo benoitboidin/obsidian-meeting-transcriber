@@ -88,7 +88,7 @@ export class MTSettingTab extends PluginSettingTab {
 		super(app, plugin);
 	}
 
-	async display(): Promise<void> {
+	display(): void {
 		const { containerEl } = this;
 		const s = this.plugin.settings;
 		const save = () => this.plugin.saveSettings();
@@ -134,28 +134,8 @@ export class MTSettingTab extends PluginSettingTab {
 				.setDesc("System audio needs a loopback device: install BlackHole 2ch (`brew install --cask blackhole-2ch`), then create a Multi-Output Device with your speakers + BlackHole in Audio MIDI Setup and use it as output. Grant Obsidian microphone and Screen & System Audio Recording permissions. macOS records the mic only unless a loopback device is present.")
 				.addButton((b) => b.setButtonText("Re-detect").onClick(() => this.display()));
 		}
-		let sources: AudioSource[] = [];
-		try { sources = await listSources(s.ffmpegPath); } catch { /* ffmpeg missing */ }
-		const srcOptions = (kind: AudioSource["kind"], label: string) => {
-			const o: Record<string, string> = { "": label };
-			for (const x of sources) if (x.kind === kind) o[x.name] = x.name;
-			return o;
-		};
-		const loopbackMissing = isMac && !sources.some((x) => x.kind === "monitor");
-		new Setting(containerEl)
-			.setName("Microphone")
-			.setDesc(isMac ? "Input device used for your own voice." : "")
-			.addDropdown((d) => d.addOptions(srcOptions("mic", "System default"))
-				.setValue(s.micSource).onChange(async (v) => { s.micSource = v; await save(); }));
-		new Setting(containerEl)
-			.setName("System audio (remote participants)")
-			.setDesc(isMac
-				? (loopbackMissing
-					? "⚠️ No loopback input found — install BlackHole 2ch to record online meetings."
-					: "Your BlackHole/loopback input device.")
-				: "A '.monitor' source of your output device.")
-			.addDropdown((d) => d.addOptions(srcOptions("monitor", isMac ? "Default loopback" : "Monitor of default output"))
-				.setValue(s.monitorSource).onChange(async (v) => { s.monitorSource = v; await save(); }));
+		// Listing devices runs ffmpeg / pw-dump: fill this part in once they answer.
+		void this.renderDevices(containerEl.createDiv(), isMac);
 		new Setting(containerEl)
 			.setName("Audio folder")
 			.setDesc("Where recordings are written (kept outside the vault so obsidian-git ignores them).")
@@ -232,5 +212,34 @@ export class MTSettingTab extends PluginSettingTab {
 					b.setDisabled(false).setButtonText("Check");
 				}
 			}));
+	}
+
+	/** Microphone and system-audio pickers; listing devices runs ffmpeg / pw-dump, so it is async. */
+	private async renderDevices(el: HTMLElement, isMac: boolean): Promise<void> {
+		const s = this.plugin.settings;
+		const save = () => this.plugin.saveSettings();
+		let sources: AudioSource[] = [];
+		try { sources = await listSources(s.ffmpegPath); } catch { /* ffmpeg missing */ }
+		el.empty();
+		const srcOptions = (kind: AudioSource["kind"], label: string) => {
+			const o: Record<string, string> = { "": label };
+			for (const x of sources) if (x.kind === kind) o[x.name] = x.name;
+			return o;
+		};
+		const loopbackMissing = isMac && !sources.some((x) => x.kind === "monitor");
+		new Setting(el)
+			.setName("Microphone")
+			.setDesc(isMac ? "Input device used for your own voice." : "")
+			.addDropdown((d) => d.addOptions(srcOptions("mic", "System default"))
+				.setValue(s.micSource).onChange(async (v) => { s.micSource = v; await save(); }));
+		new Setting(el)
+			.setName("System audio (remote participants)")
+			.setDesc(isMac
+				? (loopbackMissing
+					? "⚠️ No loopback input found — install BlackHole 2ch to record online meetings."
+					: "Your BlackHole/loopback input device.")
+				: "A '.monitor' source of your output device.")
+			.addDropdown((d) => d.addOptions(srcOptions("monitor", isMac ? "Default loopback" : "Monitor of default output"))
+				.setValue(s.monitorSource).onChange(async (v) => { s.monitorSource = v; await save(); }));
 	}
 }

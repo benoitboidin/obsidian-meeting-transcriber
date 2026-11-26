@@ -41,7 +41,7 @@ async function chat(s: MTSettings, system: string, user: string): Promise<string
 			],
 		}),
 	});
-	const content: string = r.json?.message?.content ?? "";
+	const content = (r.json as { message?: { content?: string } } | null)?.message?.content ?? "";
 	return content.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
 }
 

@@ -38,17 +38,24 @@ export async function listSources(ffmpegPath = "ffmpeg"): Promise<AudioSource[]>
 	return listPulseSources();
 }
 
+/** The part of a `pw-dump` entry we read. */
+interface PwObject {
+	type?: string;
+	info?: { props?: { "node.name"?: string; "media.class"?: string } };
+}
+
 /** Lists PulseAudio-compatible source names (mics + "<sink>.monitor") from PipeWire. */
 function listPulseSources(): Promise<AudioSource[]> {
 	return new Promise((resolve, reject) =>
 		execFile("pw-dump", { maxBuffer: 64 * 1024 * 1024 }, (err, stdout) => {
-			if (err) return reject(err);
+			if (err) return reject(new Error(`pw-dump failed: ${err.message}`));
 			const out: AudioSource[] = [];
-			for (const o of JSON.parse(stdout)) {
+			for (const o of JSON.parse(stdout) as PwObject[]) {
 				const props = o?.info?.props;
-				if (o?.type !== "PipeWire:Interface:Node" || !props?.["node.name"]) continue;
-				if (props["media.class"] === "Audio/Source") out.push({ name: props["node.name"], kind: "mic" });
-				if (props["media.class"] === "Audio/Sink") out.push({ name: `${props["node.name"]}.monitor`, kind: "monitor" });
+				const name = props?.["node.name"];
+				if (o?.type !== "PipeWire:Interface:Node" || !name) continue;
+				if (props["media.class"] === "Audio/Source") out.push({ name, kind: "mic" });
+				if (props["media.class"] === "Audio/Sink") out.push({ name: `${name}.monitor`, kind: "monitor" });
 			}
 			resolve(out);
 		}));
@@ -180,7 +187,7 @@ export class Recorder {
 		this.stderrTail = "";
 		const procs = captures.map((c) => {
 			const proc = spawn(this.ffmpegPath(), c.args, { stdio: ["pipe", "ignore", "pipe"] });
-			proc.stderr?.on("data", (d) => {
+			proc.stderr?.on("data", (d: Buffer) => {
 				this.stderrTail = (this.stderrTail + `[${c.label}] ${d.toString()}`).slice(-2000);
 			});
 			return proc;
@@ -204,10 +211,10 @@ export class Recorder {
 			const done = (err?: Error) => {
 				if (settled) return;
 				settled = true;
-				clearTimeout(timer);
+				window.clearTimeout(timer);
 				if (err) reject(err); else resolve();
 			};
-			const timer = setTimeout(() => done(), ms);
+			const timer = window.setTimeout(() => done(), ms);
 			for (const p of procs) {
 				p.once("error", (e) => done(e));
 				p.once("exit", (code) => done(new Error(`ffmpeg exited (${code}): ${this.stderrTail}`)));
@@ -222,9 +229,9 @@ export class Recorder {
 		if (!procs.length || !cur) throw new Error("Not recording");
 		await Promise.all(procs.map((p) => new Promise<void>((resolve) => {
 			if (p.exitCode !== null || p.signalCode !== null) return resolve();
-			const kill = setTimeout(() => { try { p.kill("SIGINT"); } catch { /* gone */ } }, 5000);
-			const force = setTimeout(() => { try { p.kill("SIGKILL"); } catch { /* gone */ } resolve(); }, 8000);
-			p.once("exit", () => { clearTimeout(kill); clearTimeout(force); resolve(); });
+			const kill = window.setTimeout(() => { try { p.kill("SIGINT"); } catch { /* gone */ } }, 5000);
+			const force = window.setTimeout(() => { try { p.kill("SIGKILL"); } catch { /* gone */ } resolve(); }, 8000);
+			p.once("exit", () => { window.clearTimeout(kill); window.clearTimeout(force); resolve(); });
 			try { p.stdin?.write("q"); p.stdin?.end(); } catch { try { p.kill("SIGINT"); } catch { /* gone */ } }
 		})));
 		this.procs = [];

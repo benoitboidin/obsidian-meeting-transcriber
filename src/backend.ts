@@ -79,7 +79,15 @@ export interface JobInput {
 	me: string;
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise((r) => window.setTimeout(r, ms));
+
+interface JobStatus {
+	status: "queued" | "running" | "done" | "error";
+	stage: string;
+	progress: number;
+	result?: TranscriptResult;
+	error?: string;
+}
 
 export class Backend {
 	private proc: ChildProcess | null = null;
@@ -188,9 +196,9 @@ export class Backend {
 			const id = (r.json as { id: string }).id;
 			for (;;) {
 				await sleep(1500);
-				const j = (await requestUrl({ url: `${this.base}/jobs/${id}` })).json;
+				const j = (await requestUrl({ url: `${this.base}/jobs/${id}` })).json as JobStatus;
 				if (j.status === "done") return j.result as TranscriptResult;
-				if (j.status === "error") throw new Error(j.error);
+				if (j.status === "error") throw new Error(j.error ?? "transcription failed");
 				onProgress(j.stage, j.progress);
 			}
 		} finally {

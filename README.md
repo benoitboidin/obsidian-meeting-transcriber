@@ -83,6 +83,8 @@ Tips: use headphones in online meetings for the cleanest separation; setting the
 - **External programs:** the plugin runs `ffmpeg` (recording/conversion), `pw-dump` (listing audio devices, Linux) and `uv`, which starts a Python server bundled in the plugin. The server's source is written to the backend folder (default `~/.local/share/meeting-transcriber/backend`) and listens on `127.0.0.1` only.
 - **Network use:** on first run, `uv` downloads Python packages from PyPI, and the server downloads model weights from HuggingFace (using your token for pyannote). Summaries call your Ollama server (default `http://127.0.0.1:11434`). **No audio, transcript or note content is sent to any remote service** by this plugin, and there is no telemetry.
 - **Files outside the vault:** recordings are stored in `~/.local/share/meeting-transcriber/recordings` (deleted after transcription unless *Keep audio* is on); the Python environment lives in the backend folder. Both paths are configurable.
+- **Environment and system information:** the plugin reads your home folder path and the `PATH`, `HOME`, `XDG_DATA_HOME` and `APPDATA` environment variables, only to find `uv`/`ffmpeg` and its data folders, and passes the environment on to the programs it starts. Nothing from it is stored or sent anywhere.
+- **Vault file list:** *Transcribe an audio/video file* lists the audio and video files in your vault so you can pick one. No other files are read.
 - **Consent:** recording people may require their consent depending on where you live. You are responsible for informing participants.
 
 ## Development
@@ -91,10 +93,11 @@ Tips: use headphones in online meetings for the cleanest separation; setting the
 npm install
 npm run dev        # watch build
 npm run build      # production build
+npm run lint       # the same lint rules as Obsidian's review bot
 cd backend && uv run python pipeline.py --mic audio.m4a [--system system.wav --me Alice]
 ```
 
-Releasing: `npm version patch` (updates `manifest.json` and `versions.json`), push the tag, and attach `main.js` and `manifest.json` to a GitHub release with the same tag.
+Releasing: `npm version patch` (updates `manifest.json` and `versions.json` and creates the tag), then `git push origin main --follow-tags`. The GitHub Action builds, attests and publishes the release with `main.js` and `manifest.json`.
 
 ## License
 
