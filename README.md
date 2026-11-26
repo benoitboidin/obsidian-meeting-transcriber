@@ -2,7 +2,7 @@
 
 Record online and in-person meetings and get a **speaker-labelled transcript and summary** written straight into your notes — with **local models only**. Your audio never leaves your computer.
 
-- **Transcription:** [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (Whisper large-v3, GPU if available)
+- **Transcription:** Whisper large-v3 — [faster-whisper](https://github.com/SYSTRAN/faster-whisper) on NVIDIA GPUs/CPU, [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) on the Apple GPU
 - **Speaker diarization:** [pyannote](https://github.com/pyannote/pyannote-audio) (`speaker-diarization-community-1`)
 - **Summary:** any [Ollama](https://ollama.com) model (default `qwen3.5:9b`)
 
@@ -42,7 +42,7 @@ This plugin drives local programs; it is **desktop-only**.
 | [ffmpeg](https://ffmpeg.org) | Recording and audio conversion |
 | **Linux with PipeWire or PulseAudio** | Recording on Linux (mic + system audio). |
 | **macOS 14+ (Apple Silicon)** | Recording on macOS (see below). *Transcribe an audio/video file* also works on Intel Macs except for the PyTorch diarization step. |
-| NVIDIA GPU (recommended) | A few minutes per hour of audio; CPU works but is much slower |
+| NVIDIA GPU or Apple Silicon (recommended) | A few minutes per hour of audio; CPU works but is much slower |
 | [Ollama](https://ollama.com) (optional) | Summaries |
 | HuggingFace account (free) | One-time download of the pyannote diarization model |
 
@@ -62,7 +62,7 @@ macOS cannot capture system audio without a loopback device, so online meetings 
 3. Grant Obsidian **Microphone** and **Screen & System Audio Recording** access in **System Settings → Privacy & Security**.
 4. Reload the plugin settings and click **Re-detect** next to *Detected binaries* and under *Recording*: the mic and the BlackHole loopback should appear.
 
-In-person meetings only need the microphone. Transcription runs on the CPU on Macs (faster-whisper has no Apple GPU support); speaker detection uses the Apple GPU (MPS) when available and falls back to CPU automatically. Prefer `large-v3-turbo` or `medium` on Macs: `large-v3` on CPU is slow.
+In-person meetings only need the microphone. On Apple Silicon, everything runs on the Apple GPU: transcription with [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) and speaker detection with PyTorch (MPS), with an automatic fall back to the CPU if either fails. `large-v3-turbo` is a good default on Macs: much faster than `large-v3` and nearly as accurate. Intel Macs transcribe on the CPU.
 
 ## Usage
 

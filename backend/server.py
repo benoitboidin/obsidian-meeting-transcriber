@@ -61,6 +61,7 @@ def health():
     mps = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
     return {"ok": True, "cuda": cuda, "mps": mps,
             "device": "cuda" if cuda else "mps" if mps else "cpu",
+            "asr": pipeline.pick_asr_device(),
             "gpu": torch.cuda.get_device_name(0) if cuda else None}
 
 
