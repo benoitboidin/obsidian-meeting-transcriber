@@ -20,6 +20,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import traceback
 import wave
 from collections import Counter
 from dataclasses import dataclass, asdict
@@ -147,12 +148,78 @@ def pick_torch_device() -> torch.device:
 
 # --------------------------------------------------------------------------- ASR
 
+def _mlx_available() -> bool:
+    if sys.platform != "darwin" or os.environ.get("MT_ASR") == "cpu":
+        return False
+    try:
+        import mlx_whisper  # noqa: F401  (only installed on Apple Silicon)
+        return True
+    except Exception:
+        return False
+
+
 def pick_asr_device() -> str:
-    """CTranslate2 (faster-whisper) runs on CUDA or CPU; the PyPI wheels have no Apple Metal support."""
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    """CUDA → faster-whisper on GPU; Apple Silicon → mlx-whisper on the Apple GPU; else CPU."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if os.environ.get("MT_ASR") == "mlx" or _mlx_available():
+        return "mlx"
+    return "cpu"
+
+
+# Our model names → MLX-converted weights on HuggingFace.
+MLX_REPOS = {
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+    "turbo": "mlx-community/whisper-large-v3-turbo",
+    "large-v2": "mlx-community/whisper-large-v2-mlx",
+}
+
+
+class MlxWhisper:
+    """mlx-whisper behind faster-whisper's transcribe() interface (the subset we use).
+
+    mlx-whisper has no VAD, so we run faster-whisper's Silero VAD first, transcribe only
+    the speech, and map timestamps back — the same thing faster-whisper does internally.
+    Skipping silences avoids Whisper's hallucinations on them and saves time.
+    """
+
+    def __init__(self, model_name: str):
+        import mlx_whisper
+
+        self._mlx = mlx_whisper
+        self.repo = MLX_REPOS.get(model_name) or (
+            model_name if "/" in model_name else f"mlx-community/whisper-{model_name}-mlx")
+
+    def transcribe(self, audio: np.ndarray, language: Optional[str] = None, **_):
+        from types import SimpleNamespace as NS
+        from faster_whisper.vad import SpeechTimestampsMap, VadOptions, get_speech_timestamps
+
+        speech = get_speech_timestamps(audio, VadOptions())
+        if not speech:
+            return [], NS(language=language)
+        joined = np.concatenate([audio[c["start"]:c["end"]] for c in speech])
+        ts = SpeechTimestampsMap(speech, SR)
+        r = self._mlx.transcribe(
+            joined, path_or_hf_repo=self.repo, language=language or None,
+            word_timestamps=True, condition_on_previous_text=False,
+            hallucination_silence_threshold=2.0, verbose=None)
+        segments = []
+        for seg in r.get("segments", []):
+            words = []
+            for w in seg.get("words") or []:
+                idx = ts.get_chunk_index((w["start"] + w["end"]) / 2)
+                words.append(NS(start=ts.get_original_time(w["start"], idx),
+                                end=ts.get_original_time(w["end"], idx), word=w["word"]))
+            if words:
+                segments.append(NS(end=words[-1].end, words=words))
+        return segments, NS(language=r.get("language") or language)
 
 
 def load_whisper(model_name: str, device: str):
+    if device == "mlx":
+        return MlxWhisper(model_name)
+
     from faster_whisper import WhisperModel
 
     if device == "cuda":
@@ -418,7 +485,15 @@ def run(mic: str, system: Optional[str] = None, me: str = "Me",
                 del model
                 free_gpu()
 
-        mic_words, sys_words, lang = run_asr(pick_asr_device())
+        asr_device = pick_asr_device()
+        try:
+            mic_words, sys_words, lang = run_asr(asr_device)
+        except Exception as e:
+            if asr_device != "mlx":
+                raise
+            traceback.print_exc()
+            warnings.append(f"Apple GPU transcription failed, used the CPU instead: {e}")
+            mic_words, sys_words, lang = run_asr("cpu")
 
         # Track that needs diarization: system (online) or mic (in-person / file)
         words, wav, chunks = (sys_words, sys_wav, sys_chunks) if sys_wav else (mic_words, mic_wav, mic_chunks)

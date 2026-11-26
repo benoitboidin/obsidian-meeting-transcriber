@@ -43,6 +43,8 @@ export interface Health {
 	cuda: boolean;
 	mps?: boolean;
 	device?: "cuda" | "mps" | "cpu";
+	/** Whisper engine: "cuda"/"cpu" = faster-whisper, "mlx" = mlx-whisper on the Apple GPU. */
+	asr?: "cuda" | "mlx" | "cpu";
 	gpu: string | null;
 }
 
