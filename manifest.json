@@ -1,7 +1,7 @@
 {
   "id": "meeting-transcriber",
   "name": "Meeting Transcriber",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "minAppVersion": "1.5.0",
   "description": "Record online and in-person meetings, then insert a speaker-labelled transcript and summary into your notes using local models only.",
   "author": "Benoît Boidin",
