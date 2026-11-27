@@ -1,6 +1,6 @@
 {
   "name": "obsidian-meeting-transcriber",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Record meetings and get local diarized transcripts + summaries in your notes",
   "main": "main.js",
   "scripts": {
