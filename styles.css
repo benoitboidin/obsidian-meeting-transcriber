@@ -1,0 +1,64 @@
+/* Live transcript (right sidebar) */
+.mt-live {
+	display: flex;
+	flex-direction: column;
+	padding: 0 !important;
+}
+
+.mt-live-status {
+	padding: var(--size-4-2) var(--size-4-3);
+	border-bottom: 1px solid var(--background-modifier-border);
+	color: var(--text-muted);
+	font-size: var(--font-ui-small);
+}
+
+.mt-live-status.is-live::before {
+	content: "";
+	display: inline-block;
+	width: 8px;
+	height: 8px;
+	margin-right: var(--size-4-2);
+	border-radius: 50%;
+	background: var(--color-red);
+	animation: mt-pulse 1.6s ease-in-out infinite;
+}
+
+.mt-live-status.is-error {
+	color: var(--text-error);
+}
+
+@keyframes mt-pulse {
+	50% { opacity: 0.3; }
+}
+
+.mt-live-list {
+	flex: 1;
+	overflow-y: auto;
+	padding: var(--size-4-2) var(--size-4-3);
+	user-select: text;
+}
+
+.mt-live-line {
+	margin-bottom: var(--size-4-2);
+	line-height: var(--line-height-normal);
+}
+
+.mt-live-time {
+	margin-right: var(--size-4-2);
+	color: var(--text-faint);
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+}
+
+.mt-live-speaker {
+	margin-right: var(--size-4-1);
+	font-weight: var(--font-semibold);
+}
+
+.mt-live-speaker::after {
+	content: ":";
+}
+
+.mt-track-mic .mt-live-speaker {
+	color: var(--text-accent);
+}

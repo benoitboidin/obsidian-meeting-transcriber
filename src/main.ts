@@ -1,8 +1,9 @@
 import { FileSystemAdapter, Notice, Plugin, setIcon, TFile } from "obsidian";
 import * as fs from "fs";
 import * as path from "path";
-import { Backend, TranscriptResult } from "./backend";
+import { Backend, JobInput, TranscriptResult } from "./backend";
 import { askTitle, MediaPickerModal, RenameSpeakersModal } from "./modals";
+import { LIVE_VIEW_TYPE, LiveSession, LiveTranscriptView } from "./liveView";
 import { hms, plainTranscript, transcriptFromNote, writeResult } from "./noteWriter";
 import { Recorder, RecordingMode } from "./recorder";
 import { DEFAULT_SETTINGS, MTSettings, MTSettingTab, resolveBinary } from "./settings";
@@ -16,6 +17,7 @@ export default class MeetingTranscriberPlugin extends Plugin {
 	private ribbonEl!: HTMLElement;
 	private timer: number | null = null;
 	private recordTarget: TFile | null = null;
+	private live: LiveSession | null = null;
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -26,10 +28,12 @@ export default class MeetingTranscriberPlugin extends Plugin {
 		this.statusEl = this.addStatusBarItem();
 		this.statusEl.addClass("mod-clickable");
 		this.statusEl.onClickEvent(() => { if (this.recorder.isRecording) void this.stopRecording(); });
+		this.registerView(LIVE_VIEW_TYPE, (leaf) => new LiveTranscriptView(leaf));
 		this.ribbonEl = this.addRibbonIcon("mic", "Start/stop meeting recording (online)", () => void this.toggle("online"));
 
 		this.addCommand({ id: "toggle-online", name: "Start/stop recording — online meeting (mic + system audio)", callback: () => void this.toggle("online") });
 		this.addCommand({ id: "toggle-in-person", name: "Start/stop recording — in-person meeting (mic only)", callback: () => void this.toggle("in-person") });
+		this.addCommand({ id: "show-live", name: "Show live transcript", callback: () => void this.openLiveView() });
 		this.addCommand({
 			id: "transcribe-file", name: "Transcribe an audio/video file",
 			callback: () => new MediaPickerModal(this.app, vaultBase, (p) => void this.transcribeFile(p)).open(),
@@ -59,6 +63,8 @@ export default class MeetingTranscriberPlugin extends Plugin {
 
 	onunload(): void {
 		this.stopTimer();
+		void this.live?.cancel();
+		this.live = null;
 		this.backend.stop();
 		if (this.recorder.isRecording) {
 			this.recorder.stop()
@@ -107,8 +113,33 @@ export default class MeetingTranscriberPlugin extends Plugin {
 		new Notice(mode === "online" ? "Recording mic + system audio…" : "Recording microphone…");
 		this.startTimer();
 		this.updateUi();
-		// Warm up the backend while the meeting runs.
-		this.backend.ensureRunning().catch(() => { /* reported later */ });
+		const files = this.recorder.files;
+		if (this.settings.liveTranscript && files) {
+			const view = await this.openLiveView();
+			view?.reset(mode === "online" ? { mic: this.settings.myName, system: "Others" } : { mic: "", system: "" });
+			this.live = new LiveSession(this.backend, files, () => this.liveView());
+		} else {
+			// Warm up the backend while the meeting runs.
+			this.backend.ensureRunning().catch(() => { /* reported later */ });
+		}
+	}
+
+	private liveView(): LiveTranscriptView | null {
+		const leaf = this.app.workspace.getLeavesOfType(LIVE_VIEW_TYPE)[0];
+		return leaf?.view instanceof LiveTranscriptView ? leaf.view : null;
+	}
+
+	/** Opens (or reveals) the live transcript in the right sidebar. */
+	private async openLiveView(): Promise<LiveTranscriptView | null> {
+		let leaf = this.app.workspace.getLeavesOfType(LIVE_VIEW_TYPE)[0];
+		if (!leaf) {
+			const right = this.app.workspace.getRightLeaf(false);
+			if (!right) return null;
+			await right.setViewState({ type: LIVE_VIEW_TYPE, active: true });
+			leaf = right;
+		}
+		await this.app.workspace.revealLeaf(leaf);
+		return this.liveView();
 	}
 
 	private async stopRecording(): Promise<void> {
@@ -122,54 +153,68 @@ export default class MeetingTranscriberPlugin extends Plugin {
 			this.stopTimer();
 			this.updateUi();
 		}
-		const title = this.settings.outputMode === "new-note" ? await askTitle(this.app) : "";
+		const live = this.live;
+		this.live = null;
+		const liveId = live ? await live.stop() : null;
+		// Ask for the title while the end of the meeting is being transcribed.
+		const title = this.settings.outputMode === "new-note" ? askTitle(this.app) : Promise.resolve("");
 		await this.process(
-			{ mic: rec.mic, system: rec.system, me: this.settings.myName },
+			{ mic: rec.mic, system: rec.system, me: this.settings.myName, liveId: liveId ?? undefined },
 			rec.startedAt, title, rec.dir, this.recordTarget,
 		);
 	}
 
 	private async transcribeFile(absPath: string): Promise<void> {
 		const target = this.settings.outputMode === "cursor" ? this.app.workspace.getActiveFile() : null;
-		const title = this.settings.outputMode === "new-note" ? await askTitle(this.app) : "";
+		const title = this.settings.outputMode === "new-note" ? askTitle(this.app) : Promise.resolve("");
 		const mtime = fs.statSync(absPath).mtime;
-		await this.process({ mic: absPath, me: this.settings.myName }, mtime, title || path.parse(absPath).name, null, target);
+		await this.process({ mic: absPath, me: this.settings.myName }, mtime,
+			title.then((t) => t || path.parse(absPath).name), null, target);
 	}
 
 	/** Shared pipeline: transcribe → summarize → write → cleanup. */
 	private async process(
-		input: { mic: string; system?: string; me: string }, date: Date, title: string,
+		input: JobInput, date: Date, titleP: Promise<string>,
 		audioDir: string | null, target: TFile | null,
 	): Promise<void> {
 		const notice = new Notice("Meeting Transcriber: starting backend…", 0);
+		const status = (message: string) => {
+			notice.setMessage(`Meeting Transcriber: ${message}`);
+			if (input.liveId) this.liveView()?.show({ kind: "processing", message: `${message[0].toUpperCase()}${message.slice(1)}` });
+		};
+		const fail = (message: string) => {
+			notice.hide();
+			new Notice(message, 0);
+			if (input.liveId) this.liveView()?.show({ kind: "error", message });
+		};
 		let res: TranscriptResult;
 		try {
 			res = await this.backend.transcribe(input, (stage, frac) =>
-				notice.setMessage(`Meeting Transcriber: ${stage}${frac > 0 && frac < 1 ? ` ${Math.round(frac * 100)}%` : "…"}`));
+				status(`${stage}${frac > 0 && frac < 1 ? ` ${Math.round(frac * 100)}%` : "…"}`));
 		} catch (e) {
-			notice.hide();
-			new Notice(`Transcription failed: ${(e as Error).message}${audioDir ? `\nAudio kept in ${audioDir}` : ""}`, 0);
+			fail(`Transcription failed: ${(e as Error).message}${audioDir ? `\nAudio kept in ${audioDir}` : ""}`);
 			return;
 		}
 		if (!res.segments.length) {
-			notice.hide();
-			new Notice(`No speech detected.${audioDir ? ` Audio kept in ${audioDir}` : ""}`, 10000);
+			fail(`No speech detected.${audioDir ? ` Audio kept in ${audioDir}` : ""}`);
 			return;
 		}
 
 		let summary: string | null = null;
 		if (this.settings.summarize) {
 			try {
-				summary = await summarize(this.settings, plainTranscript(res.segments), res.language,
-					(m) => notice.setMessage(`Meeting Transcriber: ${m}`));
+				summary = await summarize(this.settings, plainTranscript(res.segments), res.language, status);
 			} catch (e) {
 				res.warnings = [...(res.warnings ?? []), `Summary failed (is Ollama running?): ${(e as Error).message}`];
 			}
 		}
 
+		status("waiting for the title…");
+		const title = await titleP;
 		const file = await writeResult(this.app, this.settings, res, summary, date, title,
 			target ? { file: target, mode: "cursor" } : undefined);
 		notice.hide();
+		if (input.liveId) this.liveView()?.show({ kind: "saved", file });
 		new Notice(`Transcript written to ${file.basename} (${hms(res.duration)})`);
 		if (!target) await this.app.workspace.getLeaf(false).openFile(file);
 

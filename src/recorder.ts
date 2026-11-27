@@ -131,6 +131,11 @@ export class Recorder {
 		return this.current?.mode ?? null;
 	}
 
+	/** Files being written by the current recording. */
+	get files(): { mic: string; system?: string } | null {
+		return this.current ? { mic: this.current.mic, system: this.current.system } : null;
+	}
+
 	get startedAt(): Date | null {
 		return this.current?.startedAt ?? null;
 	}
@@ -143,7 +148,8 @@ export class Recorder {
 		fs.mkdirSync(dir, { recursive: true });
 		const micFile = path.join(dir, "mic.wav");
 		const sysFile = path.join(dir, "system.wav");
-		const out = ["-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"];
+		// -flush_packets: write audio to disk as it comes, so the live transcript can read it.
+		const out = ["-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-flush_packets", "1"];
 
 		const captures: Capture[] = [];
 		if (isMac) {

@@ -9,6 +9,7 @@ export interface MTSettings {
 	myName: string;
 	language: string; // "" = auto
 	whisperModel: string;
+	liveTranscript: boolean;
 	hfToken: string;
 	minSpeakers: number; // 0 = auto
 	maxSpeakers: number; // 0 = auto
@@ -78,6 +79,7 @@ export const DEFAULT_SETTINGS: MTSettings = {
 	outputMode: "new-note",
 	notesFolder: "Meetings",
 	collapseTranscript: true,
+	liveTranscript: true,
 	summarize: true,
 	ollamaUrl: "http://127.0.0.1:11434",
 	ollamaModel: "qwen3.5:9b",
@@ -113,6 +115,10 @@ export class MTSettingTab extends PluginSettingTab {
 				.addOptions({ "large-v3": "large-v3", "large-v3-turbo": "large-v3-turbo", medium: "medium", small: "small" })
 				.setValue(s.whisperModel)
 				.onChange(async (v) => { s.whisperModel = v; await save(); }));
+		new Setting(containerEl)
+			.setName("Live transcript")
+			.setDesc("Transcribe while you record and show it in the sidebar. The note is then ready a few seconds after you stop, instead of minutes. Keeps the model on the GPU during the meeting.")
+			.addToggle((t) => t.setValue(s.liveTranscript).onChange(async (v) => { s.liveTranscript = v; await save(); }));
 		new Setting(containerEl)
 			.setName("HuggingFace token")
 			.setDesc("Needed once to download pyannote diarization. Accept the terms of pyannote/speaker-diarization-community-1 on huggingface.co first.")

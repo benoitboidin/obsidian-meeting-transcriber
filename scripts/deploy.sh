@@ -15,5 +15,5 @@ DEST="$VAULT/.obsidian/plugins/meeting-transcriber"
 cd "$ROOT"
 npm run build
 mkdir -p "$DEST"
-cp main.js manifest.json "$DEST"/
+cp main.js manifest.json styles.css "$DEST"/
 echo "Deployed to $DEST — reload Obsidian (or toggle the plugin) to pick it up."

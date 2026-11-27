@@ -6,48 +6,31 @@ Usage as CLI (for testing):
 Online meeting  : mic track = the user (named), system track = remote people (diarized).
 In-person/file  : only one track, fully diarized.
 
-Long recordings are processed in chunks (default 30 min, cut at the quietest
-point near each boundary) so memory use stays bounded whatever the duration.
-Speakers found in different chunks are linked with their pyannote embeddings.
+Long recordings are processed in chunks (default 30 min, cut at the quietest point
+near each boundary) so memory use stays bounded whatever the duration.
 """
 from __future__ import annotations
 
 import argparse
 import difflib
-import gc
 import json
 import os
-import subprocess
 import sys
 import tempfile
-import traceback
-import wave
-from collections import Counter
-from dataclasses import dataclass, asdict
-from typing import Callable, Optional
+from dataclasses import asdict, dataclass
+from typing import TYPE_CHECKING, Callable, Optional
 
 import numpy as np
 
-# torch must be imported before faster_whisper so CUDA/cuDNN libs shipped with
-# the torch wheels are loaded into the process for ctranslate2 as well.
-import torch  # noqa: E402
+from asr import Transcriber, Word, transcribe_file
+from audio import Wav, plan_chunks, to_wav16k
+
+if TYPE_CHECKING:
+    from live import LiveSession
 
 Progress = Callable[[str, float], None]
 
-SR = 16000
 CHUNK_SEC = 30 * 60
-# The plugin passes the ffmpeg path it found (GUI apps may not have it on PATH).
-FFMPEG = os.environ.get("MT_FFMPEG") or "ffmpeg"
-# Cosine distance under which two speakers from different chunks are considered the same person.
-LINK_THRESHOLD = 0.5
-
-
-@dataclass
-class Word:
-    start: float
-    end: float
-    text: str
-    speaker: str = ""
 
 
 @dataclass
@@ -62,318 +45,7 @@ def _noop(_stage: str, _frac: float) -> None:
     pass
 
 
-# ------------------------------------------------------------------------ Audio
-
-def _is_wav16k_mono(path: str) -> bool:
-    try:
-        with wave.open(path, "rb") as f:
-            return f.getframerate() == SR and f.getnchannels() == 1 and f.getsampwidth() == 2
-    except Exception:
-        return False
-
-
-def to_wav16k(path: str, tmpdir: str) -> str:
-    """16 kHz mono s16 WAV (converted with ffmpeg unless it already is one)."""
-    if _is_wav16k_mono(path):
-        return path
-    out = os.path.join(tmpdir, os.path.basename(path) + ".16k.wav")
-    try:
-        subprocess.run(
-            [FFMPEG, "-nostdin", "-y", "-loglevel", "error", "-i", path,
-             "-vn", "-ac", "1", "-ar", str(SR), "-c:a", "pcm_s16le", out],
-            check=True,
-        )
-    except FileNotFoundError:
-        raise RuntimeError(
-            f"ffmpeg was not found (tried {FFMPEG!r}). Install it (macOS: brew install ffmpeg) "
-            "and set its path in the plugin settings.")
-    return out
-
-
-class Wav:
-    """Random access to a 16 kHz mono s16 WAV without loading it whole."""
-
-    def __init__(self, path: str):
-        self.f = wave.open(path, "rb")
-        self.frames = self.f.getnframes()
-        self.duration = self.frames / SR
-
-    def read(self, start: float, end: float) -> np.ndarray:
-        a = max(0, int(start * SR))
-        b = min(self.frames, int(end * SR))
-        self.f.setpos(a)
-        data = self.f.readframes(max(0, b - a))
-        return np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-
-    def close(self) -> None:
-        self.f.close()
-
-
-def plan_chunks(wav: Wav, chunk_sec: float, search: float = 60.0) -> list[tuple[float, float]]:
-    """Split into ~chunk_sec pieces, cutting at the quietest 200 ms in the minute before each boundary."""
-    dur = wav.duration
-    cuts = [0.0]
-    t = chunk_sec
-    while t < dur - chunk_sec * 0.25:
-        ws = max(cuts[-1] + 1.0, t - search)
-        win = wav.read(ws, t)
-        hop = SR // 5
-        n = len(win) // hop
-        if n:
-            energy = (win[: n * hop].reshape(n, hop) ** 2).mean(axis=1)
-            cut = ws + (int(energy.argmin()) + 0.5) * 0.2
-        else:
-            cut = t
-        cuts.append(cut)
-        t = cut + chunk_sec
-    cuts.append(dur)
-    return list(zip(cuts[:-1], cuts[1:]))
-
-
-def free_gpu() -> None:
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
-def pick_torch_device() -> torch.device:
-    """Best torch device for diarization: CUDA, then Apple Metal (MPS), then CPU."""
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    mps = getattr(torch.backends, "mps", None)
-    if mps is not None and mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-# --------------------------------------------------------------------------- ASR
-
-def _mlx_available() -> bool:
-    if sys.platform != "darwin" or os.environ.get("MT_ASR") == "cpu":
-        return False
-    try:
-        import mlx_whisper  # noqa: F401  (only installed on Apple Silicon)
-        return True
-    except Exception:
-        return False
-
-
-def pick_asr_device() -> str:
-    """CUDA → faster-whisper on GPU; Apple Silicon → mlx-whisper on the Apple GPU; else CPU."""
-    if torch.cuda.is_available():
-        return "cuda"
-    if os.environ.get("MT_ASR") == "mlx" or _mlx_available():
-        return "mlx"
-    return "cpu"
-
-
-# Our model names → MLX-converted weights on HuggingFace.
-MLX_REPOS = {
-    "large-v3": "mlx-community/whisper-large-v3-mlx",
-    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
-    "turbo": "mlx-community/whisper-large-v3-turbo",
-    "large-v2": "mlx-community/whisper-large-v2-mlx",
-}
-
-
-class MlxWhisper:
-    """mlx-whisper behind faster-whisper's transcribe() interface (the subset we use).
-
-    mlx-whisper has no VAD, so we run faster-whisper's Silero VAD first, transcribe only
-    the speech, and map timestamps back — the same thing faster-whisper does internally.
-    Skipping silences avoids Whisper's hallucinations on them and saves time.
-    """
-
-    def __init__(self, model_name: str):
-        import mlx_whisper
-
-        self._mlx = mlx_whisper
-        self.repo = MLX_REPOS.get(model_name) or (
-            model_name if "/" in model_name else f"mlx-community/whisper-{model_name}-mlx")
-
-    def transcribe(self, audio: np.ndarray, language: Optional[str] = None, **_):
-        from types import SimpleNamespace as NS
-        from faster_whisper.vad import SpeechTimestampsMap, VadOptions, get_speech_timestamps
-
-        speech = get_speech_timestamps(audio, VadOptions())
-        if not speech:
-            return [], NS(language=language)
-        joined = np.concatenate([audio[c["start"]:c["end"]] for c in speech])
-        ts = SpeechTimestampsMap(speech, SR)
-        r = self._mlx.transcribe(
-            joined, path_or_hf_repo=self.repo, language=language or None,
-            word_timestamps=True, condition_on_previous_text=False,
-            hallucination_silence_threshold=2.0, verbose=None)
-        segments = []
-        for seg in r.get("segments", []):
-            words = []
-            for w in seg.get("words") or []:
-                idx = ts.get_chunk_index((w["start"] + w["end"]) / 2)
-                words.append(NS(start=ts.get_original_time(w["start"], idx),
-                                end=ts.get_original_time(w["end"], idx), word=w["word"]))
-            if words:
-                segments.append(NS(end=words[-1].end, words=words))
-        return segments, NS(language=r.get("language") or language)
-
-
-def load_whisper(model_name: str, device: str):
-    if device == "mlx":
-        return MlxWhisper(model_name)
-
-    from faster_whisper import WhisperModel
-
-    if device == "cuda":
-        return WhisperModel(model_name, device="cuda", compute_type="float16")
-    try:
-        return WhisperModel(model_name, device="cpu", compute_type="int8")
-    except Exception:
-        # int8 is not available on every CPU (some ARM builds): fall back to fp32.
-        return WhisperModel(model_name, device="cpu", compute_type="float32")
-
-
-def transcribe(model, wav: Wav, chunks: list[tuple[float, float]], language: Optional[str],
-               label: str, progress: Progress) -> tuple[list[Word], Optional[str]]:
-    words: list[Word] = []
-    langs: Counter[str] = Counter()
-    total = wav.duration or 1.0
-    for cs, ce in chunks:
-        segments, info = model.transcribe(
-            wav.read(cs, ce),
-            language=language or None,
-            vad_filter=True,
-            word_timestamps=True,
-            beam_size=5,
-            condition_on_previous_text=False,
-        )
-        n = 0
-        for seg in segments:
-            for w in seg.words or []:
-                words.append(Word(cs + w.start, cs + w.end, w.word))
-                n += 1
-            progress(f"transcribing {label}", min((cs + seg.end) / total, 1.0))
-        if n:
-            langs[info.language] += n
-        progress(f"transcribing {label}", min(ce / total, 1.0))
-    lang = language or (langs.most_common(1)[0][0] if langs else None)
-    return words, lang
-
-
-# --------------------------------------------------------------------- Diarize
-
-def load_diarizer(hf_token: Optional[str], device: Optional[torch.device] = None):
-    from pyannote.audio import Pipeline
-
-    if not hf_token:
-        raise RuntimeError("no HuggingFace token set in the plugin settings.")
-    target = device or torch.device("cpu")
-    first_err: Exception | None = None
-    for name in ("pyannote/speaker-diarization-community-1",
-                 "pyannote/speaker-diarization-3.1"):
-        try:
-            pipe = Pipeline.from_pretrained(name, token=hf_token)
-            if pipe is None:
-                raise RuntimeError(f"could not load {name}")
-            try:
-                pipe.to(target)
-            except Exception:  # some backends lack ops used by the pipeline
-                pipe.to(torch.device("cpu"))
-            return pipe
-        except Exception as e:  # try the fallback model
-            first_err = first_err or e
-    msg = str(first_err)
-    if "403" in msg or "restricted" in msg or "Gated" in type(first_err).__name__:
-        raise RuntimeError(
-            "your HuggingFace account has not been granted access to the model. Accept the "
-            "conditions at https://hf.co/pyannote/speaker-diarization-community-1 (same account as the token).")
-    if "401" in msg:
-        raise RuntimeError("the HuggingFace token is invalid or expired.")
-    raise RuntimeError(f"could not load the pyannote model: {msg.splitlines()[0] if msg else first_err!r}")
-
-
-@dataclass
-class LocalSpeaker:
-    chunk: int
-    label: str
-    emb: Optional[np.ndarray]
-    dur: float
-
-
-def diarize(pipe, wav: Wav, chunks: list[tuple[float, float]], min_speakers: Optional[int],
-            max_speakers: Optional[int], progress: Progress,
-            link_threshold: float = LINK_THRESHOLD) -> list[tuple[float, float, str]]:
-    """Diarize chunk by chunk, then link speakers across chunks. Returns global (start, end, speaker) turns."""
-    turns: list[tuple[float, float, int, str]] = []  # start, end, chunk, local label
-    locals_: list[LocalSpeaker] = []
-    for i, (cs, ce) in enumerate(chunks):
-        progress("identifying speakers", i / len(chunks))
-        audio = torch.from_numpy(wav.read(cs, ce)).unsqueeze(0)
-        kwargs = {}
-        if max_speakers:
-            kwargs["max_speakers"] = max_speakers
-        if min_speakers and len(chunks) == 1:  # a single chunk may contain fewer people
-            kwargs["min_speakers"] = min_speakers
-        out = pipe({"waveform": audio, "sample_rate": SR}, **kwargs)
-        full = getattr(out, "speaker_diarization", out)
-        excl = getattr(out, "exclusive_speaker_diarization", None) or full
-        embs = getattr(out, "speaker_embeddings", None)
-        for k, label in enumerate(full.labels()):
-            e = None
-            if embs is not None and k < len(embs) and np.all(np.isfinite(embs[k])):
-                e = np.asarray(embs[k], dtype=np.float64)
-            locals_.append(LocalSpeaker(i, label, e, full.label_duration(label)))
-        for turn, _, spk in excl.itertracks(yield_label=True):
-            turns.append((cs + turn.start, cs + turn.end, i, spk))
-        del audio, out
-        free_gpu()
-    progress("identifying speakers", 1.0)
-
-    mapping = link_speakers(locals_, link_threshold, max_speakers)
-    return [(s, e, mapping[(c, l)]) for s, e, c, l in turns]
-
-
-def link_speakers(speakers: list[LocalSpeaker], threshold: float,
-                  max_speakers: Optional[int]) -> dict[tuple[int, str], str]:
-    """Agglomerative clustering of per-chunk speakers (duration-weighted centroids).
-
-    Two speakers from the same chunk are never merged (pyannote already separated them).
-    """
-    clusters: list[dict] = []
-    for sp in speakers:
-        clusters.append({
-            "members": [sp],
-            "chunks": {sp.chunk},
-            "sum": sp.emb * max(sp.dur, 1e-3) if sp.emb is not None else None,
-        })
-
-    def dist(a: dict, b: dict) -> float:
-        if a["sum"] is None or b["sum"] is None or a["chunks"] & b["chunks"]:
-            return float("inf")
-        x, y = a["sum"], b["sum"]
-        return 1.0 - float(x @ y / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-12))
-
-    while len(clusters) > 1:
-        best, bi, bj = float("inf"), -1, -1
-        for i in range(len(clusters)):
-            for j in range(i + 1, len(clusters)):
-                d = dist(clusters[i], clusters[j])
-                if d < best:
-                    best, bi, bj = d, i, j
-        too_many = bool(max_speakers) and len(clusters) > max_speakers
-        if bi < 0 or (best > threshold and not too_many):
-            break
-        a, b = clusters[bi], clusters.pop(bj)
-        a["members"] += b["members"]
-        a["chunks"] |= b["chunks"]
-        a["sum"] = a["sum"] + b["sum"]
-
-    # Number speakers by total speaking time, most talkative first
-    clusters.sort(key=lambda c: -sum(m.dur for m in c["members"]))
-    mapping: dict[tuple[int, str], str] = {}
-    for gi, c in enumerate(clusters):
-        for m in c["members"]:
-            mapping[(m.chunk, m.label)] = f"G{gi:03d}"
-    return mapping
-
+# ---------------------------------------------------------------------- Merge
 
 def assign_speakers(words: list[Word], turns: list[tuple[float, float, str]]) -> None:
     """Give each word the speaker whose turn overlaps it most (or the nearest one)."""
@@ -452,11 +124,17 @@ def drop_bleed(mic: list[Segment], system: list[Segment], threshold: float = 0.6
 
 # ------------------------------------------------------------------------ Main
 
+
+# ----------------------------------------------------------------------- Main
+
 def run(mic: str, system: Optional[str] = None, me: str = "Me",
         language: Optional[str] = None, hf_token: Optional[str] = None,
         whisper_model: str = "large-v3", min_speakers: Optional[int] = None,
         max_speakers: Optional[int] = None, progress: Progress = _noop,
-        chunk_sec: float = CHUNK_SEC) -> dict:
+        chunk_sec: float = CHUNK_SEC, live: Optional["LiveSession"] = None,
+        after_asr: Callable[[], None] = lambda: None) -> dict:
+    """`live`: a live session that already transcribed this recording while it was made.
+    `after_asr`: called once transcription is done (e.g. to unload Whisper before diarization)."""
     hf_token = hf_token or os.environ.get("HF_TOKEN")
     warnings: list[str] = []
 
@@ -468,56 +146,40 @@ def run(mic: str, system: Optional[str] = None, me: str = "Me",
         sys_chunks = plan_chunks(sys_wav, chunk_sec) if sys_wav else []
         duration = max(mic_wav.duration, sys_wav.duration if sys_wav else 0.0)
 
-        def run_asr(device: str) -> tuple[list[Word], list[Word], Optional[str]]:
+        if live is not None:
+            progress("finishing live transcript", 0.0)
+            if not live.finish():
+                warnings.append(f"Live transcript failed ({live.error}); transcribed again after the meeting.")
+                live = None
+        if live is not None:
+            mic_words, sys_words = live.words("mic"), live.words("system")
+            lang = live.detected_language()
+            warnings += live.tr.warnings
+        else:
+            tr = Transcriber(whisper_model)
             progress("loading whisper", 0.0)
-            model = load_whisper(whisper_model, device)
-            try:
-                mic_words, lang = transcribe(model, mic_wav, mic_chunks, language,
-                                             "your mic" if sys_wav else "audio", progress)
-                remote: list[Word] = []
-                if sys_wav:
-                    remote, sys_lang = transcribe(model, sys_wav, sys_chunks, language or lang,
-                                                  "remote audio", progress)
-                    if sys_lang and len(remote) >= len(mic_words):
-                        lang = sys_lang
-                return mic_words, remote, lang
-            finally:
-                del model
-                free_gpu()
+            mic_words, lang = transcribe_file(tr, mic_wav, mic_chunks, language,
+                                              "your mic" if sys_wav else "audio", progress)
+            sys_words: list[Word] = []
+            if sys_wav:
+                sys_words, sys_lang = transcribe_file(tr, sys_wav, sys_chunks, language or lang,
+                                                      "remote audio", progress)
+                if sys_lang and len(sys_words) >= len(mic_words):
+                    lang = sys_lang
+            warnings += tr.warnings
 
-        asr_device = pick_asr_device()
-        try:
-            mic_words, sys_words, lang = run_asr(asr_device)
-        except Exception as e:
-            if asr_device != "mlx":
-                raise
-            traceback.print_exc()
-            warnings.append(f"Apple GPU transcription failed, used the CPU instead: {e}")
-            mic_words, sys_words, lang = run_asr("cpu")
+        after_asr()
 
         # Track that needs diarization: system (online) or mic (in-person / file)
         words, wav, chunks = (sys_words, sys_wav, sys_chunks) if sys_wav else (mic_words, mic_wav, mic_chunks)
         if words:
             progress("identifying speakers", 0.0)
-            turns: list[tuple[float, float, str]] = []
-            diar_device = pick_torch_device()
             try:
-                pipe = load_diarizer(hf_token, diar_device)
-                try:
-                    turns = diarize(pipe, wav, chunks, min_speakers, max_speakers, progress)
-                except Exception:
-                    if diar_device.type != "mps":
-                        raise
-                    # MPS can lack ops used by pyannote: retry this pipeline on CPU.
-                    del pipe
-                    free_gpu()
-                    pipe = load_diarizer(hf_token, torch.device("cpu"))
-                    turns = diarize(pipe, wav, chunks, min_speakers, max_speakers, progress)
-                del pipe
+                from diarization import run_diarization
+                turns = run_diarization(hf_token, wav, chunks, min_speakers, max_speakers, progress)
             except Exception as e:  # keep the transcript even if diarization fails
                 warnings.append(f"Diarization skipped: {e}")
                 turns = []
-            free_gpu()
             assign_speakers(words, turns)
             rename_by_appearance(words)
 

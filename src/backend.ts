@@ -5,11 +5,19 @@ import * as os from "os";
 import * as path from "path";
 import type { MTSettings } from "./settings";
 // Bundled as text by esbuild so the community-store install (main.js only) is self-contained.
+import ASR_PY from "../backend/asr.py";
+import AUDIO_PY from "../backend/audio.py";
+import DIARIZATION_PY from "../backend/diarization.py";
+import LIVE_PY from "../backend/live.py";
 import PIPELINE_PY from "../backend/pipeline.py";
 import SERVER_PY from "../backend/server.py";
 import PYPROJECT from "../backend/pyproject.toml";
 
 const BACKEND_FILES: Record<string, string> = {
+	"asr.py": ASR_PY,
+	"audio.py": AUDIO_PY,
+	"diarization.py": DIARIZATION_PY,
+	"live.py": LIVE_PY,
 	"pipeline.py": PIPELINE_PY,
 	"server.py": SERVER_PY,
 	"pyproject.toml": PYPROJECT,
@@ -79,6 +87,24 @@ export interface JobInput {
 	mic: string;
 	system?: string;
 	me: string;
+	/** Live session that already transcribed this recording while it was made. */
+	liveId?: string;
+}
+
+export interface LiveSegment {
+	start: number;
+	end: number;
+	track: "mic" | "system";
+	text: string;
+}
+
+export interface LiveStatus {
+	status: "running" | "finishing" | "done" | "error";
+	error: string | null;
+	/** Seconds of recorded audio not transcribed yet. */
+	lag: number;
+	language: string | null;
+	segments: LiveSegment[];
 }
 
 const sleep = (ms: number) => new Promise((r) => window.setTimeout(r, ms));
@@ -96,6 +122,8 @@ export class Backend {
 	private log = "";
 	private idleTimer: number | null = null;
 	private starting: Promise<Health> | null = null;
+	/** Live sessions in progress: the backend must not be stopped for idleness meanwhile. */
+	private liveSessions = 0;
 
 	constructor(private settings: () => MTSettings) {}
 
@@ -193,9 +221,11 @@ export class Backend {
 					whisper_model: s.whisperModel,
 					min_speakers: s.minSpeakers || null,
 					max_speakers: s.maxSpeakers || null,
+					live_id: input.liveId ?? null,
 				}),
 			});
 			const id = (r.json as { id: string }).id;
+			if (input.liveId) this.endLive();
 			for (;;) {
 				await sleep(1500);
 				const j = (await requestUrl({ url: `${this.base}/jobs/${id}` })).json as JobStatus;
@@ -208,6 +238,40 @@ export class Backend {
 		}
 	}
 
+	/** Starts transcribing a recording while ffmpeg writes it; returns the session id. */
+	async startLive(input: { mic: string; system?: string }): Promise<string> {
+		const s = this.settings();
+		await this.ensureRunning();
+		this.clearIdle();
+		const r = await requestUrl({
+			url: `${this.base}/live`,
+			method: "POST",
+			contentType: "application/json",
+			body: JSON.stringify({
+				mic: input.mic,
+				system: input.system ?? null,
+				language: s.language || null,
+				whisper_model: s.whisperModel,
+			}),
+		});
+		this.liveSessions++;
+		return (r.json as { id: string }).id;
+	}
+
+	/** New live segments since index `since`. */
+	async pollLive(id: string, since: number): Promise<LiveStatus> {
+		return (await requestUrl({ url: `${this.base}/live/${id}?since=${since}` })).json as LiveStatus;
+	}
+
+	async cancelLive(id: string): Promise<void> {
+		this.endLive();
+		await requestUrl({ url: `${this.base}/live/${id}`, method: "DELETE", throw: false }).catch(() => null);
+	}
+
+	private endLive(): void {
+		this.liveSessions = Math.max(0, this.liveSessions - 1);
+	}
+
 	private clearIdle(): void {
 		if (this.idleTimer !== null) window.clearTimeout(this.idleTimer);
 		this.idleTimer = null;
@@ -216,7 +280,7 @@ export class Backend {
 	private scheduleIdleStop(): void {
 		this.clearIdle();
 		const min = this.settings().backendIdleMinutes;
-		if (min > 0 && this.proc) this.idleTimer = window.setTimeout(() => this.stop(), min * 60 * 1000);
+		if (min > 0 && this.proc && this.liveSessions === 0) this.idleTimer = window.setTimeout(() => this.stop(), min * 60 * 1000);
 	}
 
 	stop(): void {
