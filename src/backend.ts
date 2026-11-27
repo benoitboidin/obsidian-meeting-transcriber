@@ -39,10 +39,19 @@ export interface Segment {
 	text: string;
 }
 
+export interface SpeakerVoice {
+	/** Unit-length voice embedding (WeSpeaker ResNet34). */
+	embedding: number[];
+	/** Seconds of speech the embedding was computed from. */
+	seconds: number;
+}
+
 export interface TranscriptResult {
 	language: string;
 	duration: number;
 	segments: Segment[];
+	/** Voice of each diarized speaker, by label. */
+	speakers?: Record<string, SpeakerVoice>;
 	warnings: string[];
 }
 

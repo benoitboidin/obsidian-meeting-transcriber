@@ -17,6 +17,8 @@ from audio import SR, Wav
 
 Progress = Callable[[str, float], None]
 Turn = tuple[float, float, str]
+# speaker label -> (voice embedding, seconds of speech)
+Voices = dict[str, tuple[np.ndarray, float]]
 
 # Cosine distance under which two speakers from different chunks are considered the same person.
 LINK_THRESHOLD = 0.5
@@ -78,8 +80,9 @@ class LocalSpeaker:
 
 def diarize(pipe, wav: Wav, chunks: list[tuple[float, float]], min_speakers: Optional[int],
             max_speakers: Optional[int], progress: Progress,
-            link_threshold: float = LINK_THRESHOLD) -> list[tuple[float, float, str]]:
-    """Diarize chunk by chunk, then link speakers across chunks. Returns global (start, end, speaker) turns."""
+            link_threshold: float = LINK_THRESHOLD) -> tuple[list[Turn], Voices]:
+    """Diarize chunk by chunk, then link speakers across chunks.
+    Returns global (start, end, speaker) turns and each speaker's voice embedding."""
     turns: list[tuple[float, float, int, str]] = []  # start, end, chunk, local label
     locals_: list[LocalSpeaker] = []
     for i, (cs, ce) in enumerate(chunks):
@@ -105,12 +108,12 @@ def diarize(pipe, wav: Wav, chunks: list[tuple[float, float]], min_speakers: Opt
         free_gpu()
     progress("identifying speakers", 1.0)
 
-    mapping = link_speakers(locals_, link_threshold, max_speakers)
-    return [(s, e, mapping[(c, l)]) for s, e, c, l in turns]
+    mapping, voices = link_speakers(locals_, link_threshold, max_speakers)
+    return [(s, e, mapping[(c, l)]) for s, e, c, l in turns], voices
 
 
 def link_speakers(speakers: list[LocalSpeaker], threshold: float,
-                  max_speakers: Optional[int]) -> dict[tuple[int, str], str]:
+                  max_speakers: Optional[int]) -> tuple[dict[tuple[int, str], str], Voices]:
     """Agglomerative clustering of per-chunk speakers (duration-weighted centroids).
 
     Two speakers from the same chunk are never merged (pyannote already separated them).
@@ -147,16 +150,21 @@ def link_speakers(speakers: list[LocalSpeaker], threshold: float,
     # Number speakers by total speaking time, most talkative first
     clusters.sort(key=lambda c: -sum(m.dur for m in c["members"]))
     mapping: dict[tuple[int, str], str] = {}
+    voices: Voices = {}
     for gi, c in enumerate(clusters):
+        label = f"G{gi:03d}"
         for m in c["members"]:
-            mapping[(m.chunk, m.label)] = f"G{gi:03d}"
-    return mapping
+            mapping[(m.chunk, m.label)] = label
+        if c["sum"] is not None:
+            voices[label] = (c["sum"] / (np.linalg.norm(c["sum"]) + 1e-12),
+                             sum(m.dur for m in c["members"]))
+    return mapping, voices
 
 
 def run_diarization(hf_token: Optional[str], wav: Wav, chunks: list[tuple[float, float]],
                     min_speakers: Optional[int], max_speakers: Optional[int],
-                    progress: Progress) -> list[Turn]:
-    """Global (start, end, speaker) turns; raises if diarization is unavailable."""
+                    progress: Progress) -> tuple[list[Turn], Voices]:
+    """Global (start, end, speaker) turns and voice embeddings; raises if unavailable."""
     device = pick_torch_device()
     pipe = load_diarizer(hf_token, device)
     try:

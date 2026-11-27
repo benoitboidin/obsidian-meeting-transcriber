@@ -4,12 +4,15 @@ import * as path from "path";
 import * as fs from "fs";
 import type MeetingTranscriberPlugin from "./main";
 import { listSources, type AudioSource } from "./recorder";
+import { DEFAULT_MATCH_THRESHOLD } from "./voices";
 
 export interface MTSettings {
 	myName: string;
 	language: string; // "" = auto
 	whisperModel: string;
 	liveTranscript: boolean;
+	recognizeVoices: boolean;
+	voiceThreshold: number;
 	hfToken: string;
 	minSpeakers: number; // 0 = auto
 	maxSpeakers: number; // 0 = auto
@@ -80,6 +83,8 @@ export const DEFAULT_SETTINGS: MTSettings = {
 	notesFolder: "Meetings",
 	collapseTranscript: true,
 	liveTranscript: true,
+	recognizeVoices: true,
+	voiceThreshold: DEFAULT_MATCH_THRESHOLD,
 	summarize: true,
 	ollamaUrl: "http://127.0.0.1:11434",
 	ollamaModel: "qwen3.5:9b",
@@ -131,6 +136,34 @@ export class MTSettingTab extends PluginSettingTab {
 			.setDesc("0 = let the model decide. Setting the exact number improves diarization.")
 			.addText((t) => t.setValue(String(s.minSpeakers)).onChange(async (v) => { s.minSpeakers = parseInt(v) || 0; await save(); }))
 			.addText((t) => t.setValue(String(s.maxSpeakers)).onChange(async (v) => { s.maxSpeakers = parseInt(v) || 0; await save(); }));
+
+		new Setting(containerEl).setName("Voices").setHeading();
+		new Setting(containerEl)
+			.setName("Recognize known voices")
+			.setDesc("Name speakers automatically when their voice is known. A voice is learned when you rename a speaker in a transcript (Rename speakers command). Voice prints stay on this computer, outside the vault.")
+			.addToggle((t) => t.setValue(s.recognizeVoices).onChange(async (v) => { s.recognizeVoices = v; await save(); }));
+		new Setting(containerEl)
+			.setName("Match strictness")
+			.setDesc("Higher = fewer wrong names but more unrecognized speakers.")
+			.addSlider((sl) => sl.setLimits(0.3, 0.8, 0.05).setValue(s.voiceThreshold)
+				.onChange(async (v) => { s.voiceThreshold = v; await save(); }));
+		const known = this.plugin.voices.list();
+		if (!known.length) {
+			new Setting(containerEl).setDesc("No voices learned yet.");
+		}
+		for (const v of known) {
+			const minutes = Math.max(1, Math.round(v.seconds / 60));
+			new Setting(containerEl)
+				.setName(v.name)
+				.setDesc(`${minutes} min of speech from ${v.meetings} meeting${v.meetings > 1 ? "s" : ""}`)
+				.addButton((b) => {
+					b.buttonEl.addClass("mod-warning");
+					b.setButtonText("Forget").onClick(() => {
+						this.plugin.voices.forget(v.name);
+						this.display();
+					});
+				});
+		}
 
 		new Setting(containerEl).setName("Recording").setHeading();
 		const isMac = process.platform === "darwin";

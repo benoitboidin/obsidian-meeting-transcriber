@@ -1,4 +1,4 @@
-import { App, FuzzySuggestModal, Modal, Notice, Setting, TFile } from "obsidian";
+import { App, FuzzySuggestModal, Modal, Setting, TFile } from "obsidian";
 import * as fs from "fs";
 import * as path from "path";
 import { TRANSCRIPT_LINE } from "./noteWriter";
@@ -73,7 +73,10 @@ export class MediaPickerModal extends FuzzySuggestModal<MediaItem> {
 export class RenameSpeakersModal extends Modal {
 	private names = new Map<string, string>();
 
-	constructor(app: App, private file: TFile, private speakers: string[]) {
+	constructor(
+		app: App, private file: TFile, private speakers: string[],
+		private onRenamed: (map: [string, string][]) => void = () => {},
+	) {
 		super(app);
 	}
 
@@ -115,7 +118,7 @@ export class RenameSpeakersModal extends Modal {
 				f.participants = f.participants.map((p: unknown) => map.find(([from]) => from === p)?.[1] ?? p);
 			}
 		});
-		new Notice(`Renamed ${map.length} speaker(s)`);
+		this.onRenamed(map);
 		this.close();
 	}
 

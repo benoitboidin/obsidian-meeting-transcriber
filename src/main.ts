@@ -6,12 +6,14 @@ import { askTitle, MediaPickerModal, RenameSpeakersModal } from "./modals";
 import { LIVE_VIEW_TYPE, LiveSession, LiveTranscriptView } from "./liveView";
 import { hms, plainTranscript, transcriptFromNote, writeResult } from "./noteWriter";
 import { Recorder, RecordingMode } from "./recorder";
-import { DEFAULT_SETTINGS, MTSettings, MTSettingTab, resolveBinary } from "./settings";
+import { dataDir, DEFAULT_SETTINGS, MTSettings, MTSettingTab, resolveBinary } from "./settings";
 import { summarize } from "./summarizer";
+import { VoiceStore } from "./voices";
 
 export default class MeetingTranscriberPlugin extends Plugin {
 	settings!: MTSettings;
 	backend!: Backend;
+	voices = new VoiceStore(() => path.join(dataDir(), "voices"));
 	private recorder!: Recorder;
 	private statusEl!: HTMLElement;
 	private ribbonEl!: HTMLElement;
@@ -200,6 +202,8 @@ export default class MeetingTranscriberPlugin extends Plugin {
 			return;
 		}
 
+		const meetingId = this.recognizeSpeakers(res);
+
 		let summary: string | null = null;
 		if (this.settings.summarize) {
 			try {
@@ -213,6 +217,9 @@ export default class MeetingTranscriberPlugin extends Plugin {
 		const title = await titleP;
 		const file = await writeResult(this.app, this.settings, res, summary, date, title,
 			target ? { file: target, mode: "cursor" } : undefined);
+		if (meetingId) {
+			await this.app.fileManager.processFrontMatter(file, (fm: Record<string, unknown>) => { fm["meeting-id"] = meetingId; });
+		}
 		notice.hide();
 		if (input.liveId) this.liveView()?.show({ kind: "saved", file });
 		new Notice(`Transcript written to ${file.basename} (${hms(res.duration)})`);
@@ -221,12 +228,41 @@ export default class MeetingTranscriberPlugin extends Plugin {
 		if (audioDir && !this.settings.keepAudio) fs.rmSync(audioDir, { recursive: true, force: true });
 	}
 
+	/**
+	 * Names speakers whose voice is known, and keeps this meeting's voices so that renaming
+	 * a speaker later teaches the plugin their voice. Returns the meeting id (null if no voices).
+	 */
+	private recognizeSpeakers(res: TranscriptResult): string | null {
+		const speakers = res.speakers ?? {};
+		if (!this.settings.recognizeVoices || !Object.keys(speakers).length) return null;
+		try {
+			const names = this.voices.match(speakers, this.settings.voiceThreshold);
+			if (Object.keys(names).length) {
+				for (const seg of res.segments) seg.speaker = names[seg.speaker] ?? seg.speaker;
+				for (const [label, name] of Object.entries(names)) {
+					speakers[name] = speakers[label];
+					delete speakers[label];
+				}
+			}
+			const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+			this.voices.saveMeeting(id, speakers);
+			return id;
+		} catch (e) {
+			res.warnings = [...(res.warnings ?? []), `Voice recognition skipped: ${(e as Error).message}`];
+			return null;
+		}
+	}
+
 	// ------------------------------------------------------------------ note tools
 
 	private async renameSpeakers(file: TFile): Promise<void> {
 		const speakers = RenameSpeakersModal.speakersIn(await this.app.vault.read(file));
 		if (!speakers.length) { new Notice("No transcript found in this note"); return; }
-		new RenameSpeakersModal(this.app, file, speakers).open();
+		new RenameSpeakersModal(this.app, file, speakers, (map) => {
+			const id = this.app.metadataCache.getFileCache(file)?.frontmatter?.["meeting-id"] as string | undefined;
+			const learned = id && this.settings.recognizeVoices ? this.voices.renamed(id, map) : [];
+			new Notice(`Renamed ${map.length} speaker(s)${learned.length ? `. Voice remembered for ${learned.join(", ")}` : ""}`);
+		}).open();
 	}
 
 	private async resummarize(file: TFile): Promise<void> {

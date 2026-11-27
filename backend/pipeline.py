@@ -73,13 +73,14 @@ def assign_speakers(words: list[Word], turns: list[tuple[float, float, str]]) ->
         w.speaker = best
 
 
-def rename_by_appearance(words: list[Word]) -> None:
-    """Renumber speakers SPEAKER_xx in order of first appearance."""
+def rename_by_appearance(words: list[Word]) -> dict[str, str]:
+    """Renumber speakers SPEAKER_xx in order of first appearance; returns old → new labels."""
     mapping: dict[str, str] = {}
     for w in words:
         if w.speaker not in mapping:
             mapping[w.speaker] = f"SPEAKER_{len(mapping):02d}"
         w.speaker = mapping[w.speaker]
+    return mapping
 
 
 # ----------------------------------------------------------------------- Merge
@@ -172,16 +173,20 @@ def run(mic: str, system: Optional[str] = None, me: str = "Me",
 
         # Track that needs diarization: system (online) or mic (in-person / file)
         words, wav, chunks = (sys_words, sys_wav, sys_chunks) if sys_wav else (mic_words, mic_wav, mic_chunks)
+        speakers: dict[str, dict] = {}
         if words:
             progress("identifying speakers", 0.0)
             try:
                 from diarization import run_diarization
-                turns = run_diarization(hf_token, wav, chunks, min_speakers, max_speakers, progress)
+                turns, voices = run_diarization(hf_token, wav, chunks, min_speakers, max_speakers, progress)
             except Exception as e:  # keep the transcript even if diarization fails
                 warnings.append(f"Diarization skipped: {e}")
-                turns = []
+                turns, voices = [], {}
             assign_speakers(words, turns)
-            rename_by_appearance(words)
+            for old, new in rename_by_appearance(words).items():
+                if old in voices:
+                    emb, secs = voices[old]
+                    speakers[new] = {"embedding": [round(float(x), 5) for x in emb], "seconds": round(secs, 1)}
 
         mic_wav.close()
         if sys_wav:
@@ -201,6 +206,8 @@ def run(mic: str, system: Optional[str] = None, me: str = "Me",
         "language": lang or "unknown",
         "duration": duration,
         "segments": [asdict(s) for s in segments],
+        # voice embedding per diarized speaker, for recognising them in later meetings
+        "speakers": speakers,
         "warnings": warnings,
     }
 
