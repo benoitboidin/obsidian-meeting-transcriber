@@ -9,7 +9,7 @@ export const VOICE_MODEL = "wespeaker-resnet34-lm";
 export const DEFAULT_MATCH_THRESHOLD = 0.5;
 
 /** A speaker needs this much speech for a reliable voice match. */
-const MIN_SECONDS = 4;
+const MIN_SECONDS = 10;
 
 /** Cap on the speech a stored voice is weighted with, so it keeps adapting to new meetings. */
 const MAX_WEIGHT_SECONDS = 600;
