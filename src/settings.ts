@@ -13,7 +13,6 @@ export interface MTSettings {
 	liveTranscript: boolean;
 	recognizeVoices: boolean;
 	voiceThreshold: number;
-	hfToken: string;
 	minSpeakers: number; // 0 = auto
 	maxSpeakers: number; // 0 = auto
 	uvPath: string;
@@ -67,7 +66,6 @@ export const DEFAULT_SETTINGS: MTSettings = {
 	myName: "Me",
 	language: "",
 	whisperModel: "large-v3",
-	hfToken: "",
 	minSpeakers: 0,
 	maxSpeakers: 0,
 	uvPath: findBin("uv"),
@@ -124,13 +122,6 @@ export class MTSettingTab extends PluginSettingTab {
 			.setName("Live transcript")
 			.setDesc("Transcribe while you record and show it in the sidebar. The note is then ready a few seconds after you stop, instead of minutes. Keeps the model on the GPU during the meeting.")
 			.addToggle((t) => t.setValue(s.liveTranscript).onChange(async (v) => { s.liveTranscript = v; await save(); }));
-		new Setting(containerEl)
-			.setName("HuggingFace token")
-			.setDesc("Needed once to download pyannote diarization. Accept the terms of pyannote/speaker-diarization-community-1 on huggingface.co first.")
-			.addText((t) => {
-				t.inputEl.type = "password";
-				t.setPlaceholder("hf_…").setValue(s.hfToken).onChange(async (v) => { s.hfToken = v.trim(); await save(); });
-			});
 		new Setting(containerEl)
 			.setName("Speakers (min / max)")
 			.setDesc("0 = let the model decide. Setting the exact number improves diarization.")
@@ -243,8 +234,8 @@ export class MTSettingTab extends PluginSettingTab {
 				b.setDisabled(true).setButtonText("Starting…");
 				try {
 					const h = await this.plugin.backend.ensureRunning();
-					const perf = h.cuda ? `GPU: ${h.gpu}` : h.asr === "mlx" ? "Apple GPU (transcription: MLX, speakers: MPS)"
-						: h.mps ? "transcription on CPU, speaker detection on Apple GPU (MPS)" : "CPU only (slow)";
+					const perf = h.cuda ? `transcription on ${h.gpu ?? "the NVIDIA GPU"}`
+						: h.asr === "mlx" ? "transcription on the Apple GPU" : "transcription on the CPU (slower)";
 					new Notice(`Backend OK — ${perf}`);
 				} catch (e) {
 					new Notice(`Backend error: ${(e as Error).message}`, 10000);

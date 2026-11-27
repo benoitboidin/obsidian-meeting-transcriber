@@ -58,8 +58,6 @@ export interface TranscriptResult {
 export interface Health {
 	ok: boolean;
 	cuda: boolean;
-	mps?: boolean;
-	device?: "cuda" | "mps" | "cpu";
 	/** Whisper engine: "cuda"/"cpu" = faster-whisper, "mlx" = mlx-whisper on the Apple GPU. */
 	asr?: "cuda" | "mlx" | "cpu";
 	gpu: string | null;
@@ -177,7 +175,6 @@ export class Backend {
 			throw new Error(`ffmpeg was not found at "${s.ffmpegPath}". Install it (macOS: brew install ffmpeg) and set its path in settings.`);
 		}
 		env.MT_FFMPEG = ffmpeg;
-		if (s.hfToken) env.HF_TOKEN = s.hfToken;
 		const cmd = [uv, "run", "--project", this.backendDir, "python", "server.py", "--port", String(s.backendPort)];
 		// On systemd Linux, run the backend in its own scope: if it ever runs out of memory,
 		// the OOM killer stops the backend only, not Obsidian.
@@ -226,7 +223,6 @@ export class Backend {
 					system: input.system ?? null,
 					me: input.me,
 					language: s.language || null,
-					hf_token: s.hfToken || null,
 					whisper_model: s.whisperModel,
 					min_speakers: s.minSpeakers || null,
 					max_speakers: s.maxSpeakers || null,

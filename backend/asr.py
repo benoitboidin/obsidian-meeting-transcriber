@@ -119,7 +119,8 @@ class MlxWhisper:
         self.repo = MLX_REPOS.get(model_name) or (
             model_name if "/" in model_name else f"mlx-community/whisper-{model_name}-mlx")
 
-    def transcribe(self, audio: np.ndarray, language: Optional[str] = None, **_):
+    def transcribe(self, audio: np.ndarray, language: Optional[str] = None,
+                   initial_prompt: Optional[str] = None, **_):
         from faster_whisper.vad import SpeechTimestampsMap, VadOptions, get_speech_timestamps
 
         speech = get_speech_timestamps(audio, VadOptions())
@@ -129,7 +130,7 @@ class MlxWhisper:
         ts = SpeechTimestampsMap(speech, SR)
         r = self._mlx.transcribe(
             joined, path_or_hf_repo=self.repo, language=language or None,
-            word_timestamps=True, condition_on_previous_text=False,
+            initial_prompt=initial_prompt, word_timestamps=True, condition_on_previous_text=False,
             hallucination_silence_threshold=2.0, verbose=None)
         segments = []
         for seg in r.get("segments", []):
@@ -180,6 +181,72 @@ def release() -> None:
 
 # ------------------------------------------------------------------- Transcribe
 
+# Whisper sometimes drops punctuation and capitals for whole windows of a meeting. A short
+# punctuated prompt (the end of the previous piece, or a phrase in the meeting's language)
+# keeps the style; each piece is decoded on its own, so a bad piece cannot derail the next.
+STYLE_PROMPTS = {
+    "en": "Hello, everyone. Okay, let's get started.",
+    "fr": "Bonjour à tous. Bon, on commence ?",
+    "de": "Hallo zusammen. Also, fangen wir an.",
+    "es": "Hola a todos. Bueno, empezamos.",
+    "it": "Ciao a tutti. Allora, iniziamo.",
+    "nl": "Hallo allemaal. Oké, laten we beginnen.",
+    "pt": "Olá a todos. Bom, vamos começar.",
+}
+PIECE_SEC = 28.0      # one Whisper window per piece
+LANG_LOCK_WORDS = 30  # once this many words are in, keep the detected language
+
+
+def prompt_for(language: Optional[str], previous: str) -> Optional[str]:
+    tail = previous.strip()[-200:]
+    if tail and any(c in tail for c in ".?!。"):
+        return tail[tail.find(" ") + 1:] if len(previous.strip()) > 200 else tail
+    return STYLE_PROMPTS.get(language or "")
+
+
+class Context:
+    """Language detection shared by the pieces of one recording."""
+
+    def __init__(self, language: Optional[str]):
+        self.user = language or None
+        self.langs: Counter[str] = Counter()
+
+    def guess(self) -> Optional[str]:
+        return self.user or (self.langs.most_common(1)[0][0] if self.langs else None)
+
+    def locked(self) -> Optional[str]:
+        """Language to force: the user's, or the detected one once confident."""
+        if self.user:
+            return self.user
+        return self.guess() if sum(self.langs.values()) >= LANG_LOCK_WORDS else None
+
+
+def plan_pieces(audio: np.ndarray) -> list[tuple[int, int]]:
+    """Contiguous pieces (samples) of at most ~PIECE_SEC, cut in pauses between speech."""
+    from audio import quietest_point
+
+    groups: list[list[float]] = []
+    for s, e in speech_regions(audio):
+        while e - s > PIECE_SEC:  # nobody pauses: cut at the quietest point near the limit
+            ws = s + PIECE_SEC - 5.0
+            cut = quietest_point(audio[int(ws * SR):int((s + PIECE_SEC) * SR)], ws)
+            groups.append([s, cut])
+            s = cut
+        if groups and e - groups[-1][0] <= PIECE_SEC:
+            groups[-1][1] = e
+        else:
+            groups.append([s, e])
+    if not groups:
+        return []
+    n = len(audio)
+    bounds = [0] + [int((a[1] + b[0]) / 2 * SR) for a, b in zip(groups, groups[1:])] + [n]
+    # don't send long silences: trim each piece to its speech, with a little margin
+    out = []
+    for (s, e), a, b in zip(groups, bounds, bounds[1:]):
+        out.append((max(a, int((s - 0.5) * SR)), min(b, int((e + 0.5) * SR))))
+    return out
+
+
 class Transcriber:
     """Transcribes audio arrays with the best available engine, falling back from
     the Apple GPU to the CPU if MLX fails."""
@@ -190,11 +257,11 @@ class Transcriber:
         self.warnings: list[str] = []
 
     def _run(self, audio: np.ndarray, offset: float, language: Optional[str],
-             on_time: Optional[Callable[[float], None]]):
+             prompt: Optional[str], on_time: Optional[Callable[[float], None]]):
         model = _model(self.model_name, self.device)
         segments, info = model.transcribe(
             audio, language=language or None, vad_filter=True, word_timestamps=True,
-            beam_size=5, condition_on_previous_text=False)
+            beam_size=5, condition_on_previous_text=False, initial_prompt=prompt)
         words: list[Word] = []
         for seg in segments:  # faster-whisper decodes lazily while we iterate
             for w in seg.words or []:
@@ -204,38 +271,56 @@ class Transcriber:
         return words, info.language
 
     def words(self, audio: np.ndarray, offset: float = 0.0, language: Optional[str] = None,
-              on_time: Optional[Callable[[float], None]] = None) -> tuple[list[Word], Optional[str]]:
-        """Words with absolute timestamps (offset added) and the detected language.
-        `on_time` is called with the time reached, as decoding progresses."""
+              on_time: Optional[Callable[[float], None]] = None,
+              prompt: Optional[str] = None) -> tuple[list[Word], Optional[str]]:
+        """Words of one piece (≤ 30 s) with absolute timestamps, and the detected language."""
         if len(audio) < SR // 10:
             return [], language
         with LOCK:
             try:
-                return self._run(audio, offset, language, on_time)
+                return self._run(audio, offset, language, prompt, on_time)
             except Exception as e:
                 if self.device != "mlx":
                     raise
                 traceback.print_exc()
                 self.warnings.append(f"Apple GPU transcription failed, used the CPU instead: {e}")
                 self.device = "cpu"
-                return self._run(audio, offset, language, on_time)
+                return self._run(audio, offset, language, prompt, on_time)
+
+    def piece(self, audio: np.ndarray, offset: float, ctx: Context, previous: str,
+              on_time: Optional[Callable[[float], None]] = None) -> list[Word]:
+        """One piece, prompted with the previous text; updates the language detection."""
+        words, lang = self.words(audio, offset, ctx.locked(), on_time, prompt_for(ctx.guess(), previous))
+        if words and lang:
+            ctx.langs[lang] += len(words)
+        return words
+
+    def long(self, audio: np.ndarray, offset: float, ctx: Context,
+             on_time: Optional[Callable[[float], None]] = None) -> list[Word]:
+        """Any length: split into pieces at pauses, each transcribed on its own."""
+        words: list[Word] = []
+        previous = ""
+        for a, b in plan_pieces(audio):
+            w = self.piece(audio[a:b], offset + a / SR, ctx, previous, on_time)
+            words += w
+            previous = "".join(x.text for x in w) or previous
+            if on_time:
+                on_time(offset + b / SR)
+        return words
 
 
 def transcribe_file(tr: Transcriber, wav: Wav, chunks: list[tuple[float, float]],
                     language: Optional[str], label: str,
                     progress: Progress) -> tuple[list[Word], Optional[str]]:
+    ctx = Context(language)
     words: list[Word] = []
-    langs: Counter[str] = Counter()
     total = wav.duration or 1.0
     for cs, ce in chunks:
         progress(f"transcribing {label}", min(cs / total, 1.0))
-        w, lang = tr.words(wav.read(cs, ce), cs, language,
-                           lambda t: progress(f"transcribing {label}", min(t / total, 1.0)))
-        words += w
-        if w and lang:
-            langs[lang] += len(w)
+        words += tr.long(wav.read(cs, ce), cs, ctx,
+                         lambda t: progress(f"transcribing {label}", min(t / total, 1.0)))
     progress(f"transcribing {label}", 1.0)
-    return words, language or (langs.most_common(1)[0][0] if langs else None)
+    return words, ctx.guess()
 
 
 def speech_regions(audio: np.ndarray) -> list[tuple[float, float]]:

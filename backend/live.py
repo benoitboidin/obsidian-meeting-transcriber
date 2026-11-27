@@ -9,18 +9,16 @@ from __future__ import annotations
 import threading
 import time
 import traceback
-from collections import Counter
 from typing import Optional
 
 import numpy as np
 
-from asr import Transcriber, Word, speech_regions
+from asr import Context, Transcriber, Word, speech_regions
 from audio import SR, GrowingWav, quietest_point
 
 MIN_SEC = 5.0      # wait for at least this much new audio before transcribing
-MAX_SEC = 30.0     # never transcribe more than this at once (Whisper's window)
+MAX_SEC = 28.0     # never transcribe more than this at once (one Whisper window)
 MIN_PAUSE = 0.4    # a pause this long is a safe place to cut
-LANG_LOCK_WORDS = 30  # once this many words are in, keep the detected language
 
 
 class Track:
@@ -29,14 +27,14 @@ class Track:
         self.wav = GrowingWav(path)
         self.pos = 0  # samples already transcribed (or skipped as silence)
         self.words: list[Word] = []
+        self.previous = ""  # last transcribed text, prompts the next piece
 
 
 class LiveSession:
     def __init__(self, tracks: dict[str, str], model_name: str, language: Optional[str]):
         self.tracks = [Track(n, p) for n, p in tracks.items()]
         self.tr = Transcriber(model_name)
-        self.language = language
-        self.langs: Counter[str] = Counter()
+        self.ctx = Context(language)
         self.segments: list[dict] = []  # append-only, polled by the plugin
         self.finishing = False
         self.cancelled = False
@@ -79,7 +77,7 @@ class LiveSession:
         return []
 
     def detected_language(self) -> Optional[str]:
-        return self.language or (self.langs.most_common(1)[0][0] if self.langs else None)
+        return self.ctx.guess()
 
     # ---------------------------------------------------------------- internal
 
@@ -132,20 +130,12 @@ class LiveSession:
         cut = self._cut(audio, final and take == pending, final)
         if not cut:
             return False
-        words, lang = self.tr.words(audio[:cut], t.pos / SR, self._language())
-        if words and lang:
-            self.langs[lang] += len(words)
+        words = self.tr.piece(audio[:cut], t.pos / SR, self.ctx, t.previous)
+        t.previous = "".join(w.text for w in words) or t.previous
         t.words += words
         t.pos += cut
         self._publish(t.name, words)
         return True
-
-    def _language(self) -> Optional[str]:
-        if self.language:
-            return self.language
-        if sum(self.langs.values()) >= LANG_LOCK_WORDS:
-            return self.langs.most_common(1)[0][0]
-        return None  # let Whisper detect it on each piece until we are confident
 
     def _publish(self, track: str, words: list[Word], max_gap: float = 1.5) -> None:
         segs: list[dict] = []

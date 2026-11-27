@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
-import os
 import sys
 import tempfile
 from dataclasses import asdict, dataclass
@@ -129,14 +128,12 @@ def drop_bleed(mic: list[Segment], system: list[Segment], threshold: float = 0.6
 # ----------------------------------------------------------------------- Main
 
 def run(mic: str, system: Optional[str] = None, me: str = "Me",
-        language: Optional[str] = None, hf_token: Optional[str] = None,
-        whisper_model: str = "large-v3", min_speakers: Optional[int] = None,
+        language: Optional[str] = None, whisper_model: str = "large-v3", min_speakers: Optional[int] = None,
         max_speakers: Optional[int] = None, progress: Progress = _noop,
         chunk_sec: float = CHUNK_SEC, live: Optional["LiveSession"] = None,
         after_asr: Callable[[], None] = lambda: None) -> dict:
     """`live`: a live session that already transcribed this recording while it was made.
     `after_asr`: called once transcription is done (e.g. to unload Whisper before diarization)."""
-    hf_token = hf_token or os.environ.get("HF_TOKEN")
     warnings: list[str] = []
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -178,7 +175,7 @@ def run(mic: str, system: Optional[str] = None, me: str = "Me",
             progress("identifying speakers", 0.0)
             try:
                 from diarization import run_diarization
-                turns, voices = run_diarization(hf_token, wav, chunks, min_speakers, max_speakers, progress)
+                turns, voices = run_diarization(wav, chunks, min_speakers, max_speakers, progress)
             except Exception as e:  # keep the transcript even if diarization fails
                 warnings.append(f"Diarization skipped: {e}")
                 turns, voices = [], {}
@@ -231,7 +228,7 @@ def main() -> None:
             print(msg, file=sys.stderr, flush=True)
             last[0] = msg
 
-    res = run(a.mic, a.system, a.me, a.language, None, a.model, a.min_speakers,
+    res = run(a.mic, a.system, a.me, a.language, a.model, a.min_speakers,
               a.max_speakers, progress=progress, chunk_sec=a.chunk_minutes * 60)
     print(json.dumps(res, ensure_ascii=False, indent=2))
 

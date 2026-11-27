@@ -82,7 +82,11 @@ export default class MeetingTranscriberPlugin extends Plugin {
 	}
 
 	async loadSettings(): Promise<void> {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, (await this.loadData()) as Partial<MTSettings> | null);
+		const saved = (await this.loadData()) as (Partial<MTSettings> & { hfToken?: string }) | null;
+		const hadToken = saved?.hfToken !== undefined;
+		if (saved) delete saved.hfToken; // no longer needed (speaker models need no account): don't keep the secret
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
+		if (hadToken) await this.saveSettings();
 		// Saved settings may point at a binary that no longer exists (or a bare name that the GUI PATH cannot find).
 		const uv = resolveBinary(this.settings.uvPath, "uv");
 		const ffmpeg = resolveBinary(this.settings.ffmpegPath, "ffmpeg");
@@ -155,11 +159,11 @@ export default class MeetingTranscriberPlugin extends Plugin {
 			this.stopTimer();
 			this.updateUi();
 		}
+		// Ask for the title while the end of the meeting is being transcribed.
+		const title = this.settings.outputMode === "new-note" ? askTitle(this.app) : Promise.resolve("");
 		const live = this.live;
 		this.live = null;
 		const liveId = live ? await live.stop() : null;
-		// Ask for the title while the end of the meeting is being transcribed.
-		const title = this.settings.outputMode === "new-note" ? askTitle(this.app) : Promise.resolve("");
 		await this.process(
 			{ mic: rec.mic, system: rec.system, me: this.settings.myName, liveId: liveId ?? undefined },
 			rec.startedAt, title, rec.dir, this.recordTarget,

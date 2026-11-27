@@ -42,7 +42,6 @@ class JobRequest(BaseModel):
     system: Optional[str] = None
     me: str = "Me"
     language: Optional[str] = None
-    hf_token: Optional[str] = None
     whisper_model: str = "large-v3"
     min_speakers: Optional[int] = None
     max_speakers: Optional[int] = None
@@ -67,14 +66,15 @@ def _worker(job_id: str, req: JobRequest) -> None:
         job["status"] = "running"
         try:
             job["result"] = pipeline.run(
-                req.mic, req.system, req.me, req.language, req.hf_token,
-                req.whisper_model, req.min_speakers, req.max_speakers, progress, live=live,
+                req.mic, req.system, req.me, req.language, req.whisper_model, req.min_speakers, req.max_speakers, progress, live=live,
                 after_asr=lambda: _release_if_idle(busy_job=True))
             job["status"] = "done"
         except Exception as e:
             traceback.print_exc()
             job["status"], job["error"] = "error", str(e)
         finally:
+            if live is not None:
+                live.cancel()  # no-op if it already finished
             if req.live_id:
                 lives.pop(req.live_id, None)
     _release_if_idle()
@@ -83,14 +83,8 @@ def _worker(job_id: str, req: JobRequest) -> None:
 @app.get("/health")
 def health():
     device = asr.pick_device()
-    try:  # the diarizer still uses PyTorch for now
-        import torch
-        mps = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
-    except Exception:
-        mps = False
     cuda = device == "cuda"
-    return {"ok": True, "cuda": cuda, "mps": mps, "asr": device,
-            "device": "cuda" if cuda else "mps" if mps else "cpu",
+    return {"ok": True, "cuda": cuda, "asr": device,
             "gpu": asr.gpu_name() if cuda else None,
             "platform": sys.platform}
 

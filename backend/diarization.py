@@ -1,19 +1,18 @@
-"""Speaker diarization with pyannote (speaker-diarization-community-1).
+"""Speaker diarization: pyannote's speaker-diarization-community-1, run with ONNX (no PyTorch).
 
-Long recordings are diarized in chunks (default 30 min); speakers found in different
-chunks are linked with their pyannote embeddings.
+Long recordings are diarized in chunks (default 30 min); speakers found in different chunks
+are linked with their voice embeddings.
 """
 from __future__ import annotations
 
-import gc
-import traceback
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 import numpy as np
-import torch
 
-from audio import SR, Wav
+import onnx_diarization
+from audio import Wav
+from models import ensure_diarization_models
 
 Progress = Callable[[str, float], None]
 Turn = tuple[float, float, str]
@@ -24,52 +23,6 @@ Voices = dict[str, tuple[np.ndarray, float]]
 LINK_THRESHOLD = 0.5
 
 
-def free_gpu() -> None:
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
-def pick_torch_device() -> torch.device:
-    """Best torch device for diarization: CUDA, then Apple Metal (MPS), then CPU."""
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    mps = getattr(torch.backends, "mps", None)
-    if mps is not None and mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def load_diarizer(hf_token: Optional[str], device: Optional[torch.device] = None):
-    from pyannote.audio import Pipeline
-
-    if not hf_token:
-        raise RuntimeError("no HuggingFace token set in the plugin settings.")
-    target = device or torch.device("cpu")
-    first_err: Exception | None = None
-    for name in ("pyannote/speaker-diarization-community-1",
-                 "pyannote/speaker-diarization-3.1"):
-        try:
-            pipe = Pipeline.from_pretrained(name, token=hf_token)
-            if pipe is None:
-                raise RuntimeError(f"could not load {name}")
-            try:
-                pipe.to(target)
-            except Exception:  # some backends lack ops used by the pipeline
-                pipe.to(torch.device("cpu"))
-            return pipe
-        except Exception as e:  # try the fallback model
-            first_err = first_err or e
-    msg = str(first_err)
-    if "403" in msg or "restricted" in msg or "Gated" in type(first_err).__name__:
-        raise RuntimeError(
-            "your HuggingFace account has not been granted access to the model. Accept the "
-            "conditions at https://hf.co/pyannote/speaker-diarization-community-1 (same account as the token).")
-    if "401" in msg:
-        raise RuntimeError("the HuggingFace token is invalid or expired.")
-    raise RuntimeError(f"could not load the pyannote model: {msg.splitlines()[0] if msg else first_err!r}")
-
-
 @dataclass
 class LocalSpeaker:
     chunk: int
@@ -78,7 +31,7 @@ class LocalSpeaker:
     dur: float
 
 
-def diarize(pipe, wav: Wav, chunks: list[tuple[float, float]], min_speakers: Optional[int],
+def diarize(wav: Wav, chunks: list[tuple[float, float]], min_speakers: Optional[int],
             max_speakers: Optional[int], progress: Progress,
             link_threshold: float = LINK_THRESHOLD) -> tuple[list[Turn], Voices]:
     """Diarize chunk by chunk, then link speakers across chunks.
@@ -86,26 +39,23 @@ def diarize(pipe, wav: Wav, chunks: list[tuple[float, float]], min_speakers: Opt
     turns: list[tuple[float, float, int, str]] = []  # start, end, chunk, local label
     locals_: list[LocalSpeaker] = []
     for i, (cs, ce) in enumerate(chunks):
-        progress("identifying speakers", i / len(chunks))
-        audio = torch.from_numpy(wav.read(cs, ce)).unsqueeze(0)
-        kwargs = {}
-        if max_speakers:
-            kwargs["max_speakers"] = max_speakers
-        if min_speakers and len(chunks) == 1:  # a single chunk may contain fewer people
-            kwargs["min_speakers"] = min_speakers
-        out = pipe({"waveform": audio, "sample_rate": SR}, **kwargs)
-        full = getattr(out, "speaker_diarization", out)
-        excl = getattr(out, "exclusive_speaker_diarization", None) or full
-        embs = getattr(out, "speaker_embeddings", None)
-        for k, label in enumerate(full.labels()):
-            e = None
-            if embs is not None and k < len(embs) and np.all(np.isfinite(embs[k])):
-                e = np.asarray(embs[k], dtype=np.float64)
-            locals_.append(LocalSpeaker(i, label, e, full.label_duration(label)))
-        for turn, _, spk in excl.itertracks(yield_label=True):
-            turns.append((cs + turn.start, cs + turn.end, i, spk))
-        del audio, out
-        free_gpu()
+        def step(stage: str, frac: float, i: int = i) -> None:
+            # segmentation is ~1/4 of the work, embeddings ~3/4
+            within = 0.25 * frac if stage == "segmentation" else 0.25 + 0.75 * frac
+            progress("identifying speakers", (i + within) / len(chunks))
+
+        full, excl, centroids = onnx_diarization.diarize(
+            wav.read(cs, ce), min_speakers=min_speakers if len(chunks) == 1 else None,
+            max_speakers=max_speakers, progress=step)
+        durations: dict[str, float] = {}
+        for s, e, label in full:
+            durations[label] = durations.get(label, 0.0) + (e - s)
+        for label, dur in durations.items():
+            e = centroids.get(label)
+            ok = e is not None and np.all(np.isfinite(e)) and np.any(e)
+            locals_.append(LocalSpeaker(i, label, np.asarray(e, dtype=np.float64) if ok else None, dur))
+        for s, e, label in excl:
+            turns.append((cs + s, cs + e, i, label))
     progress("identifying speakers", 1.0)
 
     mapping, voices = link_speakers(locals_, link_threshold, max_speakers)
@@ -161,23 +111,8 @@ def link_speakers(speakers: list[LocalSpeaker], threshold: float,
     return mapping, voices
 
 
-def run_diarization(hf_token: Optional[str], wav: Wav, chunks: list[tuple[float, float]],
-                    min_speakers: Optional[int], max_speakers: Optional[int],
-                    progress: Progress) -> tuple[list[Turn], Voices]:
+def run_diarization(wav: Wav, chunks: list[tuple[float, float]], min_speakers: Optional[int],
+                    max_speakers: Optional[int], progress: Progress) -> tuple[list[Turn], Voices]:
     """Global (start, end, speaker) turns and voice embeddings; raises if unavailable."""
-    device = pick_torch_device()
-    pipe = load_diarizer(hf_token, device)
-    try:
-        return diarize(pipe, wav, chunks, min_speakers, max_speakers, progress)
-    except Exception:
-        if device.type != "mps":
-            raise
-        # MPS can lack ops used by pyannote: retry this pipeline on CPU.
-        traceback.print_exc()
-        pipe = None
-        free_gpu()
-        pipe = load_diarizer(hf_token, torch.device("cpu"))
-        return diarize(pipe, wav, chunks, min_speakers, max_speakers, progress)
-    finally:
-        pipe = None
-        free_gpu()
+    ensure_diarization_models(lambda f: progress("downloading speaker models (33 MB, once)", f))
+    return diarize(wav, chunks, min_speakers, max_speakers, progress)
